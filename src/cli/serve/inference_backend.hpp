@@ -69,6 +69,9 @@ struct TextDiskCacheConfig {
   /// the freed headroom lets more conversation lineages park warm on the
   /// host. Requires a Flash-Next model.
   std::size_t history_budget_bytes{0};
+  /// Shared history arena budget; mutually exclusive with
+  /// history_budget_bytes (server rejects the combination).
+  std::size_t history_arena_bytes{0};
   /// Quantize Flash-Next session K/V caches to packed q8_0 blocks.
   bool kv_quant{false};
   /// Elastic-history diagnostics sink (growth, budget refusals).

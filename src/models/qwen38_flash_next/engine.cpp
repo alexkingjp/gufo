@@ -168,6 +168,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.history_budget_bytes = options.history_budget_bytes;
+  exec.history_arena_bytes = options.history_arena_bytes;
   exec.kv_quant = options.kv_quant;
   exec.history_logger = options.history_event_log;
   m->executor_ =
@@ -258,8 +259,8 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
          vision;
 }
 
-std::size_t Model::ElasticHistoryBytes(
-    core::SessionMode mode, std::uint32_t context) const noexcept {
+std::size_t Model::ElasticHistoryBytes(core::SessionMode mode,
+                                       std::uint32_t context) const noexcept {
   return executor_->ElasticHistoryBytes(mode, context);
 }
 
@@ -761,8 +762,8 @@ void Session::ApplyLookupProposals(PendingDecode* pending) {
   const std::size_t limit =
       std::min<std::size_t>(pending->chain.size() - 1, kLookupChain);
   for (std::size_t i = 0; i < limit; ++i) {
-    if (auto proposal = lookup_cache_.ProposeOne(
-            std::span(window).first(window_size))) {
+    if (auto proposal =
+            lookup_cache_.ProposeOne(std::span(window).first(window_size))) {
       pending->chain[i + 1] = static_cast<std::int32_t>(*proposal);
     }
     // The chain content — substituted or not — is the context the next
@@ -960,8 +961,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   }
   if (!exec.Rollback(*session_, keep, error_msg,
                      gpu_verification ? (pending.rollback_frontier
-                                            ? pending.rollback_frontier
-                                            : logits_.data())
+                                             ? pending.rollback_frontier
+                                             : logits_.data())
                                       : nullptr,
                      !pending.defer_rollback_wait)) {
     return false;
@@ -1302,9 +1303,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     for (std::size_t slot = 0; slot < deferred.size(); ++slot) {
       auto& p = pending[deferred[slot].first];
       p.precomputed_greedy = round_predictions.data() + deferred[slot].second;
-      p.rollback_frontier =
-          exec.BatchFrontierStaging(static_cast<std::uint32_t>(slot),
-                                    &epilogue_error);
+      p.rollback_frontier = exec.BatchFrontierStaging(
+          static_cast<std::uint32_t>(slot), &epilogue_error);
       if (p.rollback_frontier == nullptr) {
         for (auto& entry : deferred) {
           pending[entry.first].precomputed_greedy = nullptr;

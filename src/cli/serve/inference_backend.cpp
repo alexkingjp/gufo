@@ -96,10 +96,10 @@ std::size_t HostSnapshotBudgetBytes() {
   // 2026-09-26: half was too small for multi-session serving — four ~4 GiB
   // conversation histories cannot fit, so every capture was skipped and the
   // cache collapsed). --host-snapshot-gib overrides this derivation.
-  constexpr std::uint64_t kMaxDerivedSnapshotBudget = 24ULL * 1024 * 1024 *
-                                                      1024;
-  return static_cast<std::size_t>(std::min<std::uint64_t>(
-      available / 4 * 3, kMaxDerivedSnapshotBudget));
+  constexpr std::uint64_t kMaxDerivedSnapshotBudget =
+      24ULL * 1024 * 1024 * 1024;
+  return static_cast<std::size_t>(
+      std::min<std::uint64_t>(available / 4 * 3, kMaxDerivedSnapshotBudget));
 }
 
 struct QwenImageContext final : TextPromptContext {
@@ -129,9 +129,10 @@ TextPreparedPrompt PrepareQwenPrompt(
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
   const auto options = QwenChatOptions(request);
-  const auto tools = request.tool_choice == ChatRequest::ToolChoice::kNone
-                         ? std::span<const tokenization::ChatTool>{}
-                         : std::span<const tokenization::ChatTool>{request.tools};
+  const auto tools =
+      request.tool_choice == ChatRequest::ToolChoice::kNone
+          ? std::span<const tokenization::ChatTool>{}
+          : std::span<const tokenization::ChatTool>{request.tools};
   if (!has_images) {
     std::vector<tokenization::ChatByteBoundary> offsets;
     std::string error;
@@ -173,8 +174,7 @@ TextPreparedPrompt PrepareQwenPrompt(
   // image identity/frontier path rather than attach plain-text provenance.
   auto prompt = std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(
-          tokenizer, request.messages, tools,
-          options,
+          tokenizer, request.messages, tools, options,
           encoder && has_images ? encoder->identity() : std::string_view{},
           max_context));
   // Agent clients may discard an interrupted assistant entirely and append
@@ -395,9 +395,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
 }
 
 template<typename T>
-  requires(std::is_unsigned_v<T>)
-void PutLittleEndian(std::span<std::uint8_t> destination, std::size_t offset,
-                     T value) {
+requires(std::is_unsigned_v<T>) void PutLittleEndian(
+    std::span<std::uint8_t> destination, std::size_t offset, T value) {
   if (offset > destination.size() || sizeof(T) > destination.size() - offset) {
     throw std::length_error("Qwen persistent snapshot header is truncated");
   }
@@ -408,8 +407,8 @@ void PutLittleEndian(std::span<std::uint8_t> destination, std::size_t offset,
 }
 
 template<typename T>
-  requires(std::is_unsigned_v<T>)
-T GetLittleEndian(std::span<const std::uint8_t> source, std::size_t offset) {
+requires(std::is_unsigned_v<T>) T
+    GetLittleEndian(std::span<const std::uint8_t> source, std::size_t offset) {
   if (offset > source.size() || sizeof(T) > source.size() - offset) {
     throw std::invalid_argument("Qwen persistent snapshot header is truncated");
   }
@@ -1678,10 +1677,9 @@ public:
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
-        .retained_snapshot_capacity_bytes =
-            host_snapshot_capacity_bytes_ != 0
-                ? host_snapshot_capacity_bytes_
-                : HostSnapshotBudgetBytes(),
+        .retained_snapshot_capacity_bytes = host_snapshot_capacity_bytes_ != 0
+                                                ? host_snapshot_capacity_bytes_
+                                                : HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2291,7 +2289,8 @@ class QwenFlashNextTextRunnerState final : public TextRunnerState {
 public:
   QwenFlashNextTextRunnerState(const std::shared_ptr<QwenFlashNextModel>& model,
                                std::uint32_t max_context, bool use_mtp,
-                               std::size_t history_budget_bytes = 0) {
+                               std::size_t history_budget_bytes = 0,
+                               std::size_t history_arena_bytes = 0) {
     std::string error;
     session_ =
         model->CreateSession(use_mtp ? gufo::core::SessionMode::kSpeculative
@@ -2302,6 +2301,7 @@ public:
                                error);
     }
     elastic_history_ = history_budget_bytes != 0;
+    arena_history_ = history_arena_bytes != 0;
   }
 
   void Invalidate() noexcept override {
@@ -2314,10 +2314,11 @@ public:
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
-    // Elastic history lives in the shared budget the claim reserves once;
-    // the per-state measurement covers only the fixed families.
+    // Elastic and arena history both live in a shared pool the claim
+    // reserves once; the per-state measurement covers only the fixed
+    // families.
     const std::size_t history =
-        elastic_history_ ? session_->HistoryBytes() : 0;
+        (elastic_history_ || arena_history_) ? session_->HistoryBytes() : 0;
     return {.per_request_state_bytes = session_->AllocatedBytes() - history,
             .temporary_scratch_bytes = 0};
   }
@@ -2330,6 +2331,7 @@ private:
   std::unique_ptr<QwenFlashNextSession> session_;
   std::size_t position_{0};
   bool elastic_history_{false};
+  bool arena_history_{false};
 };
 
 class QwenFlashNextTextRunnerSnapshot final : public TextRunnerSnapshot {
@@ -2347,8 +2349,11 @@ public:
       for (const auto& storage : owners)
         storage_owners_.push_back({storage.owner, storage.bytes});
       metadata_owner_ = std::make_shared<const std::uint8_t>(0);
-      storage_owners_.push_back({metadata_owner_, sizeof(QwenFlashNextTextRunnerSnapshot) +
-          storage_owners_.capacity() * sizeof(ContinuationSnapshotStorageOwner) + sizeof(std::uint8_t)});
+      storage_owners_.push_back(
+          {metadata_owner_, sizeof(QwenFlashNextTextRunnerSnapshot) +
+                                storage_owners_.capacity() *
+                                    sizeof(ContinuationSnapshotStorageOwner) +
+                                sizeof(std::uint8_t)});
     }
   }
 
@@ -2402,13 +2407,15 @@ public:
                           std::string artifact_fingerprint = {},
                           std::string mtp_fingerprint = {},
                           std::size_t host_snapshot_capacity_bytes = 0,
-                          std::size_t history_budget_bytes = 0)
+                          std::size_t history_budget_bytes = 0,
+                          std::size_t history_arena_bytes = 0)
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens),
         host_snapshot_capacity_bytes_(host_snapshot_capacity_bytes),
-        history_budget_bytes_(history_budget_bytes) {
+        history_budget_bytes_(history_budget_bytes),
+        history_arena_bytes_(history_arena_bytes) {
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -2457,31 +2464,41 @@ public:
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
         .per_request_state_bytes =
-            model_->SessionBytes(
-                use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                         : gufo::core::SessionMode::kAutoregressive,
-                max_context_) -
-            (history_budget_bytes_ != 0
-                 ? model_->ElasticHistoryBytes(
-                       use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                                : gufo::core::SessionMode::kAutoregressive,
-                       max_context_) -
-                       model_->ElasticHistoryBytes(
-                           use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                                    : gufo::core::SessionMode::kAutoregressive,
-                           model_->history_initial_positions())
-                 : 0),
+            model_->SessionBytes(use_mtp_
+                                     ? gufo::core::SessionMode::kSpeculative
+                                     : gufo::core::SessionMode::kAutoregressive,
+                                 max_context_) -
+            (history_arena_bytes_ != 0
+                 ?  // Arena sessions are full-capacity; the whole history
+                    // family byte total comes from the shared pool.
+                 model_->ElasticHistoryBytes(
+                     use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                              : gufo::core::SessionMode::kAutoregressive,
+                     max_context_)
+                 : history_budget_bytes_ != 0
+                       ? model_->ElasticHistoryBytes(
+                             use_mtp_
+                                 ? gufo::core::SessionMode::kSpeculative
+                                 : gufo::core::SessionMode::kAutoregressive,
+                             max_context_) -
+                             model_->ElasticHistoryBytes(
+                                 use_mtp_
+                                     ? gufo::core::SessionMode::kSpeculative
+                                     : gufo::core::SessionMode::kAutoregressive,
+                                 model_->history_initial_positions())
+                       : 0),
         .shared_state_bytes =
-            history_budget_bytes_ != 0
+            history_arena_bytes_ != 0
+                ? std::optional<std::size_t>{history_arena_bytes_}
+            : history_budget_bytes_ != 0
                 ? std::optional<std::size_t>{history_budget_bytes_}
                 : std::nullopt,
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes =
-            host_snapshot_capacity_bytes_ != 0
-                ? host_snapshot_capacity_bytes_
-                : HostSnapshotBudgetBytes(),
+        .retained_snapshot_capacity_bytes = host_snapshot_capacity_bytes_ != 0
+                                                ? host_snapshot_capacity_bytes_
+                                                : HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2811,15 +2828,21 @@ public:
 
   [[nodiscard]] std::size_t SnapshotAllocationBytes(
       const TextRunnerState& state) const override {
-    const auto bytes = RequireQwenFlashNextState(state).session().SnapshotAllocationBytes();
+    const auto bytes =
+        RequireQwenFlashNextState(state).session().SnapshotAllocationBytes();
     if (bytes == 0 || bytes > std::numeric_limits<std::size_t>::max())
-      throw std::overflow_error("Qwen3.8-Flash-Next snapshot allocation size is unavailable");
+      throw std::overflow_error(
+          "Qwen3.8-Flash-Next snapshot allocation size is unavailable");
     const auto& geometry = model_->config();
-    const std::size_t owner_bound = 3 * (geometry.num_layers / geometry.full_attention_interval) * 64 + 5;
-    const std::size_t wrapper_bytes = sizeof(QwenFlashNextTextRunnerSnapshot) +
-        owner_bound * sizeof(ContinuationSnapshotStorageOwner) + sizeof(std::uint8_t);
+    const std::size_t owner_bound =
+        3 * (geometry.num_layers / geometry.full_attention_interval) * 64 + 5;
+    const std::size_t wrapper_bytes =
+        sizeof(QwenFlashNextTextRunnerSnapshot) +
+        owner_bound * sizeof(ContinuationSnapshotStorageOwner) +
+        sizeof(std::uint8_t);
     if (bytes > std::numeric_limits<std::size_t>::max() - wrapper_bytes)
-      throw std::overflow_error("Qwen3.8-Flash-Next snapshot wrapper allocation overflows");
+      throw std::overflow_error(
+          "Qwen3.8-Flash-Next snapshot wrapper allocation overflows");
     return static_cast<std::size_t>(bytes) + wrapper_bytes;
   }
 
@@ -2828,13 +2851,18 @@ public:
     const auto bytes =
         RequireQwenFlashNextState(state).session().SnapshotIncrementalBytes();
     if (bytes == 0 || bytes > std::numeric_limits<std::size_t>::max())
-      throw std::overflow_error("Qwen3.8-Flash-Next snapshot delta size is unavailable");
+      throw std::overflow_error(
+          "Qwen3.8-Flash-Next snapshot delta size is unavailable");
     const auto& geometry = model_->config();
-    const std::size_t owner_bound = 3 * (geometry.num_layers / geometry.full_attention_interval) * 64 + 5;
-    const std::size_t wrapper_bytes = sizeof(QwenFlashNextTextRunnerSnapshot) +
-        owner_bound * sizeof(ContinuationSnapshotStorageOwner) + sizeof(std::uint8_t);
+    const std::size_t owner_bound =
+        3 * (geometry.num_layers / geometry.full_attention_interval) * 64 + 5;
+    const std::size_t wrapper_bytes =
+        sizeof(QwenFlashNextTextRunnerSnapshot) +
+        owner_bound * sizeof(ContinuationSnapshotStorageOwner) +
+        sizeof(std::uint8_t);
     if (bytes > std::numeric_limits<std::size_t>::max() - wrapper_bytes)
-      throw std::overflow_error("Qwen3.8-Flash-Next snapshot wrapper allocation overflows");
+      throw std::overflow_error(
+          "Qwen3.8-Flash-Next snapshot wrapper allocation overflows");
     return static_cast<std::size_t>(bytes) + wrapper_bytes;
   }
 
@@ -2934,6 +2962,7 @@ private:
   std::uint32_t max_draft_tokens_;
   std::size_t host_snapshot_capacity_bytes_{0};
   std::size_t history_budget_bytes_{0};
+  std::size_t history_arena_bytes_{0};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
@@ -3137,6 +3166,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .prompt_lookup = speculative_config.prompt_lookup,
             .kv_quant = disk_cache_config.kv_quant,
             .history_budget_bytes = disk_cache_config.history_budget_bytes,
+            .history_arena_bytes = disk_cache_config.history_arena_bytes,
             .history_event_log = disk_cache_config.history_event_log,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
@@ -3479,7 +3509,8 @@ bool InferenceBackend::load(
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint,
         disk_cache_config.host_snapshot_capacity_bytes,
-        disk_cache_config.history_budget_bytes);
+        disk_cache_config.history_budget_bytes,
+        disk_cache_config.history_arena_bytes);
     new_state->model_id = runner->Descriptor().model_id;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {

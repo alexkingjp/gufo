@@ -55,6 +55,12 @@ struct ModelOptions {
   /// stays within this budget. Frees the device memory fixed-shape
   /// sessions waste on unused context, letting more lineages park warm.
   std::size_t history_budget_bytes = 0;
+  /// Shared history arena (executor::Options::history_arena_bytes): one
+  /// preallocated device pool; sessions carve refcounted regions for their
+  /// position-scaled families and return them on destruction. Mutually
+  /// exclusive with history_budget_bytes; sessions are full-capacity and
+  /// growth fails closed in this mode.
+  std::size_t history_arena_bytes = 0;
   /// Optional sink for elastic-history diagnostics (growth, budget
   /// refusals); the server injects its logger.
   std::function<void(std::string_view)> history_event_log;
