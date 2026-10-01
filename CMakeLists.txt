@@ -108,6 +108,8 @@ add_library(gufo_core STATIC
   src/core/gguf_reader.cpp
   src/core/gguf_identity.cpp
   src/core/sampling.cpp
+  src/core/json_constraint.cpp
+  src/cli/serve/structured_output.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
   src/models/minimax_h3/dit.cpp
@@ -340,11 +342,26 @@ if (BUILD_TESTING)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
 
+  add_executable(json_constraint_test tests/core/json_constraint_test.cpp)
+  target_link_libraries(json_constraint_test PRIVATE gufo_core)
+  add_test(NAME json_constraint_test COMMAND json_constraint_test)
+  set_tests_properties(json_constraint_test PROPERTIES LABELS "cpu;json;sampling")
+
+  add_executable(structured_output_test tests/cli/structured_output_test.cpp)
+  target_link_libraries(structured_output_test PRIVATE gufo_core)
+  add_test(NAME structured_output_test COMMAND structured_output_test)
+  set_tests_properties(structured_output_test PROPERTIES LABELS "cpu;json;streaming")
+
+  add_executable(tool_batch_validation_test tests/cli/tool_batch_validation_test.cpp)
+  target_link_libraries(tool_batch_validation_test PRIVATE gufo_core gufo_logging)
+  add_test(NAME tool_batch_validation_test COMMAND tool_batch_validation_test)
+  set_tests_properties(tool_batch_validation_test PROPERTIES LABELS "cpu;tools;json")
+
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
     src/cli/serve/openai_chat.cpp
   )
-  target_link_libraries(openai_chat_test PRIVATE gufo_core)
+  target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_logging)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
@@ -571,7 +588,8 @@ if (BUILD_TESTING)
     tests/models/qwen3_tts/audio_api_test.cpp
     src/cli/serve/audio_tts_api.cpp
     src/cli/serve/tts_service.cpp)
-  target_link_libraries(qwen3_tts_audio_api_test PRIVATE gufo_qwen3_tts)
+  target_link_libraries(qwen3_tts_audio_api_test PRIVATE gufo_qwen3_tts
+    gufo_core)
   add_test(NAME qwen3_tts_audio_api_test COMMAND qwen3_tts_audio_api_test)
   set_tests_properties(qwen3_tts_audio_api_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;server;api;audio;quality")

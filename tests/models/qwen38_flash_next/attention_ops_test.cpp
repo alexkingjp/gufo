@@ -294,7 +294,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
   const std::uint32_t* mask_ptr = masked ? d_mask.get() : nullptr;
 
-  q::Attention(d_q.get(), d_k.get(), d_v.get(), mask_ptr, mask_words,
+  q::Attention(d_q.get(), d_k.get(), d_v.get(), false, mask_ptr, mask_words,
                d_ref.get(), nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads,
                kDim, kRatio, nullptr);
   q::SigmoidMul(d_ref.get(), d_gate.get(), q_count, nullptr);
@@ -305,7 +305,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     HipBuffer<float> d_split(q_count);
     HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
                                 kSplits * (kDim + 2));
-    q::Attention(d_q.get(), d_k.get(), d_v.get(), mask_ptr, mask_words,
+    q::Attention(d_q.get(), d_k.get(), d_v.get(), false, mask_ptr, mask_words,
                  d_split.get(), d_partials.get(), kSplits, n_tokens,
                  d_pos.get(), kHeads, kKvHeads, kDim, kRatio, nullptr);
     q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
@@ -322,7 +322,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     }
   }
   if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
-                              mask_ptr, mask_words, d_wmma.get(), n_tokens,
+                              false, mask_ptr, mask_words, d_wmma.get(), n_tokens,
                               start_pos, kHeads, kKvHeads, kDim, kRatio,
                               nullptr)) {
     throw std::runtime_error("WMMA attention rejected the model geometry");
@@ -332,7 +332,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   const auto ref = Download(&d_ref, q_count);
   const auto out = Download(&d_wmma, q_count);
   if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
-                              mask_ptr, mask_words, d_wmma.get(), n_tokens,
+                              false, mask_ptr, mask_words, d_wmma.get(), n_tokens,
                               start_pos, kHeads, kKvHeads, kDim, kRatio,
                               nullptr)) {
     throw std::runtime_error("WMMA attention replay rejected the geometry");
@@ -345,9 +345,9 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     constexpr float poison = -12345.0F;
     Upload(&d_wmma, std::vector<float>(q_count, poison));
     if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
-                                mask_ptr, mask_words, d_wmma.get(), n_tokens,
-                                start_pos, kHeads, kKvHeads, kDim, kRatio,
-                                nullptr, true)) {
+                                false, mask_ptr, mask_words, d_wmma.get(),
+                                n_tokens, start_pos, kHeads, kKvHeads, kDim,
+                                kRatio, nullptr, true)) {
       throw std::runtime_error("last-tile attention rejected the geometry");
     }
     const auto tail = Download(&d_wmma, q_count);
@@ -405,7 +405,7 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
   const auto run = [&](std::uint32_t start, std::uint32_t rows, float* out) {
     const auto offset = std::size_t(start) * kQWidth;
     if (!q::WmmaCausalAttention(queries.get() + offset, gates.get() + offset,
-                                keys.get(), values.get(), nullptr, 0,
+                                keys.get(), values.get(), false, nullptr, 0,
                                 out + offset, rows, start, kHeads, kKvHeads,
                                 kDim, kRatio, nullptr)) {
       throw std::runtime_error("chunk attention rejected geometry");

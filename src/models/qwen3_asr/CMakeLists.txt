@@ -65,7 +65,8 @@ function(gufo_qwen3_asr_register_tests)
     ${PROJECT_SOURCE_DIR}/src/models/qwen3_asr/tests/audio_api_test.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/audio_asr_api.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/asr_service.cpp)
-  target_link_libraries(qwen3_asr_audio_api_test PRIVATE gufo_qwen3_asr)
+  target_link_libraries(qwen3_asr_audio_api_test PRIVATE gufo_qwen3_asr
+    gufo_core)
   add_test(NAME qwen3_asr_audio_api_test COMMAND qwen3_asr_audio_api_test)
   set_tests_properties(qwen3_asr_audio_api_test PROPERTIES
     LABELS "cpu;models;qwen3-asr;server;api;audio;quality")

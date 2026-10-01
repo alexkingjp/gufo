@@ -98,6 +98,15 @@ private:
     }
   };
 
+  /// A merge rule: its priority rank plus the vocabulary id of the
+  /// concatenation, resolved once at load so the merge loop never builds
+  /// strings. kInvalidTokenId marks a rule whose concatenation is absent
+  /// from the vocabulary; reaching one stops merging that piece.
+  struct MergeTarget {
+    std::uint32_t rank;
+    TokenId merged;
+  };
+
   QwenTokenizer() = default;
 
   void InitializeByteTokens(bool eager_decoded_tokens = true);
@@ -107,7 +116,7 @@ private:
   std::vector<std::string> id_to_token_;
   std::vector<std::string> id_to_decoded_token_;
   std::unordered_map<std::string, TokenId> token_to_id_;
-  std::unordered_map<std::pair<TokenId, TokenId>, std::uint32_t, PairHash>
+  std::unordered_map<std::pair<TokenId, TokenId>, MergeTarget, PairHash>
       merge_ranks_;
   std::unordered_map<std::string, TokenId> special_token_to_id_;
   std::unordered_map<TokenId, bool> is_special_token_;

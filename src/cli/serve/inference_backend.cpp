@@ -91,8 +91,15 @@ std::size_t HostSnapshotBudgetBytes() {
     }
     break;
   }
+  // Retention competes with the page cache, not with the pinned model: the
+  // derived budget keeps three quarters of the post-load headroom (measured
+  // 2026-09-26: half was too small for multi-session serving — four ~4 GiB
+  // conversation histories cannot fit, so every capture was skipped and the
+  // cache collapsed). --host-snapshot-gib overrides this derivation.
+  constexpr std::uint64_t kMaxDerivedSnapshotBudget = 24ULL * 1024 * 1024 *
+                                                      1024;
   return static_cast<std::size_t>(std::min<std::uint64_t>(
-      available / 2, std::numeric_limits<std::size_t>::max()));
+      available / 4 * 3, kMaxDerivedSnapshotBudget));
 }
 
 struct QwenImageContext final : TextPromptContext {
@@ -122,12 +129,51 @@ TextPreparedPrompt PrepareQwenPrompt(
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
   const auto options = QwenChatOptions(request);
+  const auto tools = request.tool_choice == ChatRequest::ToolChoice::kNone
+                         ? std::span<const tokenization::ChatTool>{}
+                         : std::span<const tokenization::ChatTool>{request.tools};
+  if (!has_images) {
+    std::vector<tokenization::ChatByteBoundary> offsets;
+    std::string error;
+    const auto rendered = tokenization::QwenChatTemplate::Render(
+        request.messages, tools, options, &error, nullptr, &offsets);
+    if (!rendered)
+      throw std::invalid_argument(error);
+    TextPreparedPrompt prepared;
+    prepared.tokens = tokenizer.Encode(
+        *rendered,
+        {.add_bos = false, .add_eos = false, .parse_special_tokens = true});
+    if (prepared.tokens.size() > max_context)
+      throw std::length_error("text prompt exceeds model context");
+    for (const auto& boundary :
+         tokenization::QwenChatTemplate::VerifyTokenBoundaries(
+             tokenizer, *rendered, offsets, prepared.tokens)) {
+      TextCacheBoundaryKind kind;
+      switch (boundary.kind) {
+        case tokenization::ChatBoundaryKind::kSystemEnd:
+          kind = TextCacheBoundaryKind::kSystemEnd;
+          break;
+        case tokenization::ChatBoundaryKind::kLastUserStart:
+          kind = TextCacheBoundaryKind::kLastUserStart;
+          break;
+        case tokenization::ChatBoundaryKind::kHistoryEnd:
+          kind = TextCacheBoundaryKind::kHistoryEnd;
+          if (!options.preserve_thinking || !request.tools.empty())
+            prepared.cache_prefix_tokens = boundary.token_count;
+          break;
+        case tokenization::ChatBoundaryKind::kFullPrompt:
+          kind = TextCacheBoundaryKind::kFullPrompt;
+          break;
+      }
+      prepared.cache_boundaries.push_back({kind, boundary.token_count});
+    }
+    return prepared;
+  }
+  // Expanded image tokens require their own offset proof; retain the existing
+  // image identity/frontier path rather than attach plain-text provenance.
   auto prompt = std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(
-          tokenizer, request.messages,
-          request.tool_choice == ChatRequest::ToolChoice::kNone
-              ? std::span<const tokenization::ChatTool>{}
-              : std::span<const tokenization::ChatTool>{request.tools},
+          tokenizer, request.messages, tools,
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
           max_context));
@@ -1576,11 +1622,13 @@ public:
                      std::uint32_t max_context, bool use_dspark,
                      std::uint32_t max_draft_tokens,
                      std::string artifact_fingerprint = {},
-                     std::string support_fingerprint = {})
+                     std::string support_fingerprint = {},
+                     std::size_t host_snapshot_capacity_bytes = 0)
       : model_(std::move(model)),
         max_context_(max_context),
         use_dspark_(use_dspark),
-        max_draft_tokens_(std::max(max_draft_tokens, 1u)) {
+        max_draft_tokens_(std::max(max_draft_tokens, 1u)),
+        host_snapshot_capacity_bytes_(host_snapshot_capacity_bytes) {
     if (!artifact_fingerprint.empty()) {
       if (use_dspark_ && !IsSha256Hex(support_fingerprint)) {
         throw std::invalid_argument(
@@ -1630,7 +1678,10 @@ public:
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
-        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_capacity_bytes =
+            host_snapshot_capacity_bytes_ != 0
+                ? host_snapshot_capacity_bytes_
+                : HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2167,6 +2218,7 @@ private:
   std::uint32_t max_context_;
   bool use_dspark_;
   std::uint32_t max_draft_tokens_;
+  std::size_t host_snapshot_capacity_bytes_{0};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
@@ -2238,7 +2290,8 @@ std::vector<std::int32_t> QwenFlashNextEngineTokens(
 class QwenFlashNextTextRunnerState final : public TextRunnerState {
 public:
   QwenFlashNextTextRunnerState(const std::shared_ptr<QwenFlashNextModel>& model,
-                               std::uint32_t max_context, bool use_mtp) {
+                               std::uint32_t max_context, bool use_mtp,
+                               std::size_t history_budget_bytes = 0) {
     std::string error;
     session_ =
         model->CreateSession(use_mtp ? gufo::core::SessionMode::kSpeculative
@@ -2248,6 +2301,7 @@ public:
       throw std::runtime_error("Failed to create Qwen3.8-Flash-Next session: " +
                                error);
     }
+    elastic_history_ = history_budget_bytes != 0;
   }
 
   void Invalidate() noexcept override {
@@ -2260,7 +2314,11 @@ public:
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
-    return {.per_request_state_bytes = session_->AllocatedBytes(),
+    // Elastic history lives in the shared budget the claim reserves once;
+    // the per-state measurement covers only the fixed families.
+    const std::size_t history =
+        elastic_history_ ? session_->HistoryBytes() : 0;
+    return {.per_request_state_bytes = session_->AllocatedBytes() - history,
             .temporary_scratch_bytes = 0};
   }
 
@@ -2271,6 +2329,7 @@ public:
 private:
   std::unique_ptr<QwenFlashNextSession> session_;
   std::size_t position_{0};
+  bool elastic_history_{false};
 };
 
 class QwenFlashNextTextRunnerSnapshot final : public TextRunnerSnapshot {
@@ -2281,7 +2340,22 @@ public:
       std::size_t position)
       : model(std::move(model)),
         snapshot(std::move(snapshot)),
-        position(position) {}
+        position(position) {
+    if (this->snapshot) {
+      const auto owners = this->snapshot->StorageOwners();
+      storage_owners_.reserve(owners.size() + 1);
+      for (const auto& storage : owners)
+        storage_owners_.push_back({storage.owner, storage.bytes});
+      metadata_owner_ = std::make_shared<const std::uint8_t>(0);
+      storage_owners_.push_back({metadata_owner_, sizeof(QwenFlashNextTextRunnerSnapshot) +
+          storage_owners_.capacity() * sizeof(ContinuationSnapshotStorageOwner) + sizeof(std::uint8_t)});
+    }
+  }
+
+  [[nodiscard]] std::span<const ContinuationSnapshotStorageOwner>
+  StorageOwners() const noexcept override {
+    return storage_owners_;
+  }
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
     if (snapshot == nullptr ||
@@ -2295,6 +2369,11 @@ public:
   std::shared_ptr<QwenFlashNextModel> model;
   std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> snapshot;
   std::size_t position;
+
+private:
+  // Destroy vector storage before releasing its independently accounted owner.
+  std::shared_ptr<const std::uint8_t> metadata_owner_;
+  std::vector<ContinuationSnapshotStorageOwner> storage_owners_;
 };
 
 QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
@@ -2321,11 +2400,15 @@ public:
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
                           std::string artifact_fingerprint = {},
-                          std::string mtp_fingerprint = {})
+                          std::string mtp_fingerprint = {},
+                          std::size_t host_snapshot_capacity_bytes = 0,
+                          std::size_t history_budget_bytes = 0)
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {
+        max_draft_tokens_(max_draft_tokens),
+        host_snapshot_capacity_bytes_(host_snapshot_capacity_bytes),
+        history_budget_bytes_(history_budget_bytes) {
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -2354,6 +2437,8 @@ public:
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
+                .json_constraints = true,
+                .prefix_checkpoint_alignment = model_->PrefillCapacity(),
             },
         .persistence = persistence_,
     };
@@ -2371,14 +2456,32 @@ public:
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = model_->SessionBytes(
-            use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                     : gufo::core::SessionMode::kAutoregressive,
-            max_context_),
+        .per_request_state_bytes =
+            model_->SessionBytes(
+                use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+                max_context_) -
+            (history_budget_bytes_ != 0
+                 ? model_->ElasticHistoryBytes(
+                       use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                                : gufo::core::SessionMode::kAutoregressive,
+                       max_context_) -
+                       model_->ElasticHistoryBytes(
+                           use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                                    : gufo::core::SessionMode::kAutoregressive,
+                           model_->history_initial_positions())
+                 : 0),
+        .shared_state_bytes =
+            history_budget_bytes_ != 0
+                ? std::optional<std::size_t>{history_budget_bytes_}
+                : std::nullopt,
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_capacity_bytes =
+            host_snapshot_capacity_bytes_ != 0
+                ? host_snapshot_capacity_bytes_
+                : HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2433,6 +2536,32 @@ public:
     return model_->tokenizer().Decode(tokens);
   }
 
+  [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint>
+  CreateJsonConstraint(
+      std::shared_ptr<const JsonConstraint> prototype,
+      sampling::TokenConstraint::Options options = {}) const override {
+    if (!prototype)
+      throw std::invalid_argument("JSON constraint prototype is missing");
+    std::call_once(constraint_vocabulary_once_, [&] {
+      const auto& tokenizer = model_->tokenizer();
+      auto vocabulary =
+          std::make_shared<sampling::TokenConstraint::Vocabulary>();
+      vocabulary->reserve(tokenizer.GetVocabSize());
+      for (std::size_t index = 0; index < tokenizer.GetVocabSize(); ++index) {
+        const auto token = static_cast<tokenization::TokenId>(index);
+        vocabulary->push_back({
+            .bytes = tokenizer.DecodeTokenCopy(token),
+            .stop = token == tokenizer.GetEosTokenId() ||
+                    token == tokenizer.GetPadTokenId(),
+            .special = tokenizer.IsSpecialToken(token),
+        });
+      }
+      constraint_vocabulary_ = std::move(vocabulary);
+    });
+    return std::make_shared<const sampling::TokenConstraint>(
+        std::move(prototype), constraint_vocabulary_, options);
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     return std::make_unique<QwenFlashNextTextRunnerState>(model_, max_context_,
                                                           use_mtp_);
@@ -2481,6 +2610,9 @@ public:
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qfn = RequireQwenFlashNextState(state);
     if (qfn.position() >= max_context_) {
+      if (sampler.has_constraint() && !sampler.constraint_complete())
+        throw std::length_error(
+            "model context exhausted before JSON completion");
       return {.stop = true, .piece = {}};
     }
     const auto logits = qfn.session().Logits();
@@ -2495,7 +2627,10 @@ public:
     return {
         .stop = false,
         .token = static_cast<TextRunnerToken>(token),
-        .piece = model_->TokenText(token),
+        .piece = sampler.has_constraint()
+                     ? model_->tokenizer().DecodeTokenCopy(
+                           static_cast<TextRunnerToken>(token))
+                     : model_->TokenText(token),
     };
   }
 
@@ -2521,7 +2656,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
-    if (!use_mtp_ || max_tokens == 1) {
+    if (sampler.has_constraint() || !use_mtp_ || max_tokens == 1) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -2598,7 +2733,10 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (decodes.size() < 2 || !use_mtp_) {
+    if (decodes.size() < 2 || !use_mtp_ ||
+        std::ranges::any_of(decodes, [](const auto& decode) {
+          return decode.sampler.get().has_constraint();
+        })) {
       return TextModelRunner::DecodeBatch(decodes);
     }
     const auto count = decodes.size();
@@ -2671,6 +2809,35 @@ public:
     return static_cast<std::size_t>(bytes);
   }
 
+  [[nodiscard]] std::size_t SnapshotAllocationBytes(
+      const TextRunnerState& state) const override {
+    const auto bytes = RequireQwenFlashNextState(state).session().SnapshotAllocationBytes();
+    if (bytes == 0 || bytes > std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Qwen3.8-Flash-Next snapshot allocation size is unavailable");
+    const auto& geometry = model_->config();
+    const std::size_t owner_bound = 3 * (geometry.num_layers / geometry.full_attention_interval) * 64 + 5;
+    const std::size_t wrapper_bytes = sizeof(QwenFlashNextTextRunnerSnapshot) +
+        owner_bound * sizeof(ContinuationSnapshotStorageOwner) + sizeof(std::uint8_t);
+    if (bytes > std::numeric_limits<std::size_t>::max() - wrapper_bytes)
+      throw std::overflow_error("Qwen3.8-Flash-Next snapshot wrapper allocation overflows");
+    return static_cast<std::size_t>(bytes) + wrapper_bytes;
+  }
+
+  [[nodiscard]] std::size_t SnapshotIncrementalBytes(
+      const TextRunnerState& state) const override {
+    const auto bytes =
+        RequireQwenFlashNextState(state).session().SnapshotIncrementalBytes();
+    if (bytes == 0 || bytes > std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Qwen3.8-Flash-Next snapshot delta size is unavailable");
+    const auto& geometry = model_->config();
+    const std::size_t owner_bound = 3 * (geometry.num_layers / geometry.full_attention_interval) * 64 + 5;
+    const std::size_t wrapper_bytes = sizeof(QwenFlashNextTextRunnerSnapshot) +
+        owner_bound * sizeof(ContinuationSnapshotStorageOwner) + sizeof(std::uint8_t);
+    if (bytes > std::numeric_limits<std::size_t>::max() - wrapper_bytes)
+      throw std::overflow_error("Qwen3.8-Flash-Next snapshot wrapper allocation overflows");
+    return static_cast<std::size_t>(bytes) + wrapper_bytes;
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
     const auto& qfn = RequireQwenFlashNextState(state);
@@ -2733,8 +2900,8 @@ public:
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
     (void)PersistentSnapshotPayloadBytes(snapshot);
-    sink(dynamic_cast<const QwenFlashNextTextRunnerSnapshot&>(snapshot)
-             .snapshot->bytes());
+    dynamic_cast<const QwenFlashNextTextRunnerSnapshot&>(snapshot)
+        .snapshot->StreamTo(sink);
   }
 
   void RestorePersistentSnapshot(
@@ -2759,9 +2926,14 @@ public:
 
 private:
   std::shared_ptr<QwenFlashNextModel> model_;
+  mutable std::once_flag constraint_vocabulary_once_;
+  mutable std::shared_ptr<const sampling::TokenConstraint::Vocabulary>
+      constraint_vocabulary_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  std::size_t host_snapshot_capacity_bytes_{0};
+  std::size_t history_budget_bytes_{0};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
@@ -2809,7 +2981,9 @@ struct InferenceBackend::Impl {
       const CancellationCheck& is_cancelled, const TokenCallback& on_token,
       std::string client_id,
       std::shared_ptr<const TextPromptContext> context = {},
-      bool cache_prompt = true, std::size_t cache_prefix_tokens = 0) const {
+      bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
+      std::shared_ptr<const sampling::TokenConstraint> json_constraint = {},
+      std::vector<TextCacheBoundary> cache_boundaries = {}) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -2831,6 +3005,8 @@ struct InferenceBackend::Impl {
             .prompt_context = std::move(context),
             .cache_prompt = cache_prompt,
             .cache_prefix_tokens = cache_prefix_tokens,
+            .json_constraint = std::move(json_constraint),
+            .cache_boundaries = std::move(cache_boundaries),
         });
     result = request.Wait(on_token);
 
@@ -2958,6 +3134,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                     ? speculative_config.draft_model_path
                     : std::string{},
             .max_draft_tokens = speculative_config.max_draft_tokens,
+            .prompt_lookup = speculative_config.prompt_lookup,
+            .kv_quant = disk_cache_config.kv_quant,
+            .history_budget_bytes = disk_cache_config.history_budget_bytes,
+            .history_event_log = disk_cache_config.history_event_log,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
@@ -3218,7 +3398,8 @@ bool InferenceBackend::load(
         std::move(model), max_context, use_dspark,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint,
+        disk_cache_config.host_snapshot_capacity_bytes);
     new_state->model_id = runner->Descriptor().model_id;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
@@ -3296,7 +3477,9 @@ bool InferenceBackend::load(
         speculative_config.backend == TextSpeculativeBackend::kMtp,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint,
+        disk_cache_config.host_snapshot_capacity_bytes,
+        disk_cache_config.history_budget_bytes);
     new_state->model_id = runner->Descriptor().model_id;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
@@ -3422,6 +3605,16 @@ void InferenceBackend::set_reasoning_defaults(
 #endif
 }
 
+bool InferenceBackend::supports_json_constraints() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state &&
+         state->scheduler->runner().Descriptor().capabilities.json_constraints;
+#else
+  return false;
+#endif
+}
+
 InferenceBackend::Result InferenceBackend::complete(
     std::string_view prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,
@@ -3456,7 +3649,31 @@ InferenceBackend::Result InferenceBackend::chat(
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
+    if (request.json_constraint)
+      throw std::invalid_argument(
+          "model does not support JSON constrained decoding");
     return {};
+  }
+  std::shared_ptr<const sampling::TokenConstraint> constraint;
+  if (request.json_constraint) {
+    sampling_config.Validate();
+    if (sampling_config.temperature != 0)
+      throw std::invalid_argument(
+          "JSON constrained decoding requires temperature 0");
+    const auto& runner = state->scheduler->runner();
+    constraint = runner.CreateJsonConstraint(
+        request.json_constraint,
+        {
+            .starts_in_reasoning = runner.InitialOutputState(request) ==
+                                   InitialOutputState::kReasoning,
+            .allow_tool_calls =
+                !request.tools.empty() &&
+                request.tool_choice != ChatRequest::ToolChoice::kNone,
+            .require_tool_call =
+                request.tool_choice == ChatRequest::ToolChoice::kRequired,
+        });
+    if (!constraint)
+      throw std::invalid_argument("model did not bind the JSON constraint");
   }
   auto prompt = state->scheduler->runner().PreparePrompt(request);
   if (!prompt.has_value() || prompt->tokens.empty()) {
@@ -3466,9 +3683,12 @@ InferenceBackend::Result InferenceBackend::chat(
       state, std::move(prompt->tokens), request_start, max_tokens,
       sampling_config, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens);
+      prompt->cache_prefix_tokens, std::move(constraint),
+      std::move(prompt->cache_boundaries));
 #else
-  (void)request;
+  if (request.json_constraint)
+    throw std::invalid_argument(
+        "model does not support JSON constrained decoding");
   (void)max_tokens;
   (void)sampling_config;
   (void)is_cancelled;
@@ -3490,6 +3710,27 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
+  std::shared_ptr<const sampling::TokenConstraint> constraint;
+  if (request.json_constraint) {
+    sampling_config.Validate();
+    if (sampling_config.temperature != 0)
+      throw std::invalid_argument(
+          "JSON constrained decoding requires temperature 0");
+    const auto& runner = state->scheduler->runner();
+    constraint = runner.CreateJsonConstraint(
+        request.json_constraint,
+        {
+            .starts_in_reasoning = runner.InitialOutputState(request) ==
+                                   InitialOutputState::kReasoning,
+            .allow_tool_calls =
+                !request.tools.empty() &&
+                request.tool_choice != ChatRequest::ToolChoice::kNone,
+            .require_tool_call =
+                request.tool_choice == ChatRequest::ToolChoice::kRequired,
+        });
+    if (!constraint)
+      throw std::invalid_argument("model did not bind the JSON constraint");
+  }
   auto prompt = state->scheduler->runner().PreparePrompt(request);
   if (!prompt.has_value() || prompt->tokens.empty()) {
     return TextGenerationBackend::start_chat(
@@ -3508,6 +3749,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .prompt_context = std::move(prompt->context),
           .cache_prompt = request.cache_prompt,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
+          .json_constraint = std::move(constraint),
+          .cache_boundaries = std::move(prompt->cache_boundaries),
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request));

@@ -159,6 +159,249 @@ void ApplyMinP(std::vector<Candidate>* candidates,
 
 }  // namespace
 
+TokenConstraint::TokenConstraint(
+    std::shared_ptr<const JsonConstraint> prototype,
+    std::shared_ptr<const Vocabulary> vocabulary)
+    : TokenConstraint(std::move(prototype), std::move(vocabulary), {}) {}
+
+TokenConstraint::TokenConstraint(
+    std::shared_ptr<const JsonConstraint> prototype,
+    std::shared_ptr<const Vocabulary> vocabulary, Options options)
+    : prototype_(std::move(prototype)),
+      vocabulary_(std::move(vocabulary)),
+      options_(options) {
+  if (!prototype_ || !vocabulary_ || vocabulary_->empty())
+    throw std::invalid_argument(
+        "JSON constraint requires a grammar and vocabulary");
+  if (options_.require_tool_call && !options_.allow_tool_calls)
+    throw std::invalid_argument("required tool calls must be enabled");
+}
+
+TokenConstraint::Cursor TokenConstraint::Start() const {
+  return {*prototype_,
+          options_.starts_in_reasoning
+              ? Cursor::Phase::kReasoning
+              : (options_.allow_tool_calls ? Cursor::Phase::kAnswerStart
+                                           : Cursor::Phase::kJson),
+          {}};
+}
+
+bool TokenConstraint::Complete(const Cursor& cursor) const {
+  return cursor.phase == Cursor::Phase::kAfterTool ||
+         (cursor.phase == Cursor::Phase::kJson && cursor.grammar.Complete());
+}
+
+bool TokenConstraint::Allows(const Cursor& cursor, TokenId token) const {
+  if (token >= vocabulary_->size())
+    return false;
+  auto trial = cursor;
+  try {
+    Accept(trial, token);
+    return true;
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
+}
+
+void TokenConstraint::Accept(Cursor& cursor, TokenId token) const {
+  if (token >= vocabulary_->size())
+    throw std::invalid_argument("constrained token exceeds vocabulary");
+  const auto& piece = (*vocabulary_)[token];
+  if (piece.stop) {
+    if (!Complete(cursor))
+      throw std::invalid_argument(
+          "JSON constraint cannot stop before completion");
+    return;
+  }
+  using Phase = Cursor::Phase;
+  const bool transition_special =
+      (cursor.phase == Phase::kReasoning && piece.bytes == "</think>") ||
+      ((cursor.phase == Phase::kAnswerStart ||
+        cursor.phase == Phase::kAfterTool) &&
+       options_.allow_tool_calls && piece.bytes == "<tool_call>") ||
+      (cursor.phase == Phase::kToolBody &&
+       (piece.bytes == "</tool_call>" || piece.bytes == "<function=" ||
+        piece.bytes == "</function>" || piece.bytes == "<parameter=" ||
+        piece.bytes == "</parameter>"));
+  if (piece.bytes.empty() || (piece.special && !transition_special))
+    throw std::invalid_argument(
+        "JSON constraint rejects special or empty token");
+  Advance(cursor, piece.bytes);
+}
+
+void TokenConstraint::Advance(Cursor& cursor, std::string_view bytes) const {
+  using Phase = Cursor::Phase;
+  constexpr std::string_view thought_end = "</think>";
+  constexpr std::string_view tool_start = "<tool_call>";
+  const auto whitespace = [](char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+  };
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    const char byte = bytes[index];
+    switch (cursor.phase) {
+      case Phase::kReasoning:
+        cursor.pending.push_back(byte);
+        while (!thought_end.starts_with(cursor.pending))
+          cursor.pending.erase(0, 1);
+        if (cursor.pending == thought_end) {
+          cursor.phase =
+              options_.allow_tool_calls ? Phase::kAnswerStart : Phase::kJson;
+          cursor.pending.clear();
+        }
+        break;
+      case Phase::kToolBody:
+        AdvanceToolBody(cursor, byte);
+        break;
+      case Phase::kAnswerStart:
+      case Phase::kAfterTool:
+        if (whitespace(byte)) {
+          if (cursor.pending.size() == 8)
+            throw std::invalid_argument(
+                "structured output has excessive boundary whitespace");
+          cursor.pending.push_back(byte);
+        } else if (options_.allow_tool_calls && byte == '<') {
+          cursor.phase = Phase::kToolStart;
+          cursor.pending = "<";
+        } else {
+          if (cursor.phase == Phase::kAfterTool || options_.require_tool_call)
+            throw std::invalid_argument(
+                "structured output requires a tool call");
+          cursor.phase = Phase::kJson;
+          cursor.grammar.Accept(cursor.pending +
+                                std::string(bytes.substr(index)));
+          cursor.pending.clear();
+          return;
+        }
+        break;
+      case Phase::kToolStart:
+        cursor.pending.push_back(byte);
+        if (!tool_start.starts_with(cursor.pending))
+          throw std::invalid_argument(
+              "structured output has an invalid tool marker");
+        if (cursor.pending == tool_start) {
+          cursor.pending.clear();
+          cursor.phase = Phase::kToolBody;
+          cursor.tool_phase = Cursor::ToolPhase::kStart;
+          cursor.json_closers.clear();
+          cursor.json_string = false;
+          cursor.json_escape = false;
+        }
+        break;
+      case Phase::kJson:
+        cursor.grammar.Accept(bytes.substr(index));
+        return;
+    }
+  }
+}
+
+// Framing only: the transport validates tool names, argument types and JSON.
+// Delimiters inside JSON strings or XML parameters remain payload bytes.
+void TokenConstraint::AdvanceToolBody(Cursor& cursor, char byte) const {
+  using ToolPhase = Cursor::ToolPhase;
+  constexpr std::string_view function_start = "<function=";
+  constexpr std::string_view function_end = "</function>";
+  constexpr std::string_view parameter_start = "<parameter=";
+  constexpr std::string_view parameter_end = "</parameter>";
+  constexpr std::string_view tool_end = "</tool_call>";
+  const bool whitespace =
+      byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
+  switch (cursor.tool_phase) {
+    case ToolPhase::kStart:
+      if (whitespace)
+        break;
+      if (byte == '{') {
+        cursor.json_closers.push_back('}');
+        cursor.tool_phase = ToolPhase::kJson;
+      } else if (byte == '<') {
+        cursor.pending = "<";
+        cursor.tool_phase = ToolPhase::kFunctionPrefix;
+      } else {
+        throw std::invalid_argument(
+            "tool call requires a JSON object or function tag");
+      }
+      break;
+    case ToolPhase::kJson:
+      if (cursor.json_string) {
+        if (cursor.json_escape)
+          cursor.json_escape = false;
+        else if (byte == '\\')
+          cursor.json_escape = true;
+        else if (byte == '"')
+          cursor.json_string = false;
+      } else if (byte == '"') {
+        cursor.json_string = true;
+      } else if (byte == '{' || byte == '[') {
+        cursor.json_closers.push_back(byte == '{' ? '}' : ']');
+      } else if (byte == '}' || byte == ']') {
+        if (cursor.json_closers.empty() || cursor.json_closers.back() != byte)
+          throw std::invalid_argument("tool JSON has mismatched delimiters");
+        cursor.json_closers.pop_back();
+        if (cursor.json_closers.empty())
+          cursor.tool_phase = ToolPhase::kClose;
+      }
+      break;
+    case ToolPhase::kFunctionPrefix:
+      cursor.pending.push_back(byte);
+      if (!function_start.starts_with(cursor.pending))
+        throw std::invalid_argument("invalid tool function prefix");
+      if (cursor.pending == function_start) {
+        cursor.pending.clear();
+        cursor.tool_phase = ToolPhase::kFunctionName;
+      }
+      break;
+    case ToolPhase::kFunctionName:
+    case ToolPhase::kParameterName:
+      if (byte == '>') {
+        if (cursor.pending.empty())
+          throw std::invalid_argument("empty tool function or parameter name");
+        cursor.pending.clear();
+        cursor.tool_phase = cursor.tool_phase == ToolPhase::kFunctionName
+                                ? ToolPhase::kBetweenParameters
+                                : ToolPhase::kParameterBody;
+      } else {
+        // Only presence matters here; final parsing validates the full name.
+        cursor.pending = "x";
+      }
+      break;
+    case ToolPhase::kBetweenParameters:
+      if (cursor.pending.empty() && whitespace)
+        break;
+      cursor.pending.push_back(byte);
+      if (cursor.pending == function_end) {
+        cursor.pending.clear();
+        cursor.tool_phase = ToolPhase::kClose;
+      } else if (cursor.pending == parameter_start) {
+        cursor.pending.clear();
+        cursor.tool_phase = ToolPhase::kParameterName;
+      } else if (!function_end.starts_with(cursor.pending) &&
+                 !parameter_start.starts_with(cursor.pending)) {
+        throw std::invalid_argument(
+            "invalid tool parameter or function delimiter");
+      }
+      break;
+    case ToolPhase::kParameterBody:
+      cursor.pending.push_back(byte);
+      while (!parameter_end.starts_with(cursor.pending))
+        cursor.pending.erase(0, 1);
+      if (cursor.pending == parameter_end) {
+        cursor.pending.clear();
+        cursor.tool_phase = ToolPhase::kBetweenParameters;
+      }
+      break;
+    case ToolPhase::kClose:
+      if (cursor.pending.empty() && whitespace)
+        break;
+      cursor.pending.push_back(byte);
+      if (!tool_end.starts_with(cursor.pending))
+        throw std::invalid_argument("tool call requires its closing delimiter");
+      if (cursor.pending == tool_end) {
+        cursor.pending.clear();
+        cursor.phase = Cursor::Phase::kAfterTool;
+      }
+      break;
+  }
+}
+
 void SamplingConfig::Validate() const {
   if (!std::isfinite(temperature) || temperature < 0.0F) {
     throw std::invalid_argument(
@@ -395,11 +638,13 @@ SamplingDistribution BuildDistribution(
 }
 
 SamplerState::SamplerState(SamplingConfig config,
-                           std::span<const TokenId> initial_history)
+                           std::span<const TokenId> initial_history,
+                           std::shared_ptr<const TokenConstraint> constraint)
     : config_(config),
       history_(initial_history.begin(), initial_history.end()),
       rng_state_(InitialRngState(config.seed)) {
   config_.Validate();
+  SetConstraint(std::move(constraint));
   TrimHistory();
   RebuildPenaltyCounts();
 }
@@ -409,18 +654,19 @@ SamplerState::SamplerState(const SamplerState& other)
       history_(other.history_),
       penalty_counts_(other.penalty_counts_),
       rng_state_(other.rng_state_),
-      pending_sample_(other.pending_sample_) {}
+      pending_sample_(other.pending_sample_),
+      constraint_(other.constraint_),
+      constraint_cursor_(other.constraint_cursor_
+                             ? std::make_unique<TokenConstraint::Cursor>(
+                                   *other.constraint_cursor_)
+                             : nullptr) {}
 
 SamplerState& SamplerState::operator=(const SamplerState& other) {
   if (this == &other) {
     return *this;
   }
-  config_ = other.config_;
-  history_ = other.history_;
-  penalty_counts_ = other.penalty_counts_;
-  candidate_scratch_.clear();
-  rng_state_ = other.rng_state_;
-  pending_sample_ = other.pending_sample_;
+  auto copied = SamplerState(other);
+  *this = std::move(copied);
   return *this;
 }
 
@@ -450,7 +696,32 @@ void SamplerState::CopyDrawStateFrom(const SamplerState& other) noexcept {
   pending_sample_ = other.pending_sample_;
 }
 
+void SamplerState::SetConstraint(
+    std::shared_ptr<const TokenConstraint> constraint) {
+  if (constraint && config_.temperature != 0)
+    throw std::invalid_argument(
+        "JSON constrained decoding requires temperature 0");
+  auto cursor =
+      constraint
+          ? std::make_unique<TokenConstraint::Cursor>(constraint->Start())
+          : nullptr;
+  constraint_ = std::move(constraint);
+  constraint_cursor_ = std::move(cursor);
+  pending_sample_.reset();
+}
+
+bool SamplerState::has_constraint() const noexcept {
+  return constraint_ != nullptr;
+}
+
+bool SamplerState::constraint_complete() const {
+  return constraint_cursor_ && constraint_->Complete(*constraint_cursor_);
+}
+
 void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
+  if (constraint_)
+    constraint_cursor_ =
+        std::make_unique<TokenConstraint::Cursor>(constraint_->Start());
   pending_sample_.reset();
   penalty_counts_.clear();
   history_.assign(tokens.begin(), tokens.end());
@@ -463,6 +734,12 @@ void SamplerState::Accept(TokenId token) {
 }
 
 void SamplerState::Accept(std::span<const TokenId> tokens) {
+  std::unique_ptr<TokenConstraint::Cursor> advanced;
+  if (constraint_) {
+    advanced = std::make_unique<TokenConstraint::Cursor>(*constraint_cursor_);
+    for (const auto token : tokens)
+      constraint_->Accept(*advanced, token);
+  }
   if (config_.frequency_penalty != 0 || config_.presence_penalty != 0) {
     for (const auto token : tokens) {
       auto found = std::ranges::lower_bound(penalty_counts_, token, {},
@@ -479,6 +756,8 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
     TrimHistory();
   }
   RebuildPenaltyCounts();
+  if (advanced)
+    constraint_cursor_ = std::move(advanced);
 }
 
 SamplingDistribution SamplerState::Distribution(
@@ -508,6 +787,9 @@ SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits, std::span<const TokenId> token_ids) const {
   if (logits.size() != token_ids.size())
     throw std::invalid_argument("compact logits and token IDs differ in size");
+  if (constraint_)
+    return SamplingDistribution(
+        {{SampleConstrainedGreedy(logits, token_ids), 1.0}}, 1.0);
   std::vector<TokenPenalty> penalties;
   penalties.reserve(token_ids.size());
   for (std::size_t i = 0; i < token_ids.size(); ++i) {
@@ -543,6 +825,10 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
       throw std::invalid_argument("pending sample exceeds vocabulary");
     }
     const auto token = *pending_sample_;
+    if (constraint_ && (!std::isfinite(logits[token]) ||
+                        !constraint_->Allows(*constraint_cursor_, token))) {
+      throw std::invalid_argument("pending sample violates JSON constraint");
+    }
     pending_sample_.reset();
     return token;
   }
@@ -603,7 +889,47 @@ double SamplerState::AdjustedLogit(TokenId token, float logit) const noexcept {
              : Penalize(logit, config_, *found);
 }
 
+TokenId SamplerState::SampleConstrainedGreedy(
+    std::span<const float> logits, std::span<const TokenId> token_ids) const {
+  if (logits.empty() || logits.size() > std::numeric_limits<TokenId>::max())
+    throw std::invalid_argument("invalid sampling vocabulary size");
+  const auto token_at = [&](TokenId index) {
+    return token_ids.empty() ? index : token_ids[index];
+  };
+  std::vector<Candidate> candidates;
+  candidates.reserve(logits.size());
+  for (std::size_t index = 0; index < logits.size(); ++index) {
+    if (!std::isfinite(logits[index]))
+      continue;
+    const auto id = static_cast<TokenId>(index);
+    const double adjusted = AdjustedLogit(token_at(id), logits[index]);
+    if (!std::isfinite(adjusted))
+      throw std::runtime_error(
+          "sampling penalties produced a non-finite logit");
+    candidates.push_back({id, adjusted});
+  }
+  if (candidates.empty())
+    throw std::runtime_error("logit distribution contains no finite values");
+  const auto worse = [&](const Candidate& left, const Candidate& right) {
+    return left.logit == right.logit
+               ? token_at(left.token) > token_at(right.token)
+               : left.logit < right.logit;
+  };
+  // Heapify once; grammar checks only visit candidates ahead of the winner.
+  std::make_heap(candidates.begin(), candidates.end(), worse);
+  while (!candidates.empty()) {
+    const auto index = candidates.front().token;
+    if (constraint_->Allows(*constraint_cursor_, token_at(index)))
+      return index;
+    std::pop_heap(candidates.begin(), candidates.end(), worse);
+    candidates.pop_back();
+  }
+  throw std::runtime_error("JSON constraint has no legal finite token");
+}
+
 TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
+  if (constraint_)
+    return SampleConstrainedGreedy(logits);
   if (penalty_counts_.empty()) {
     float best_logit = -std::numeric_limits<float>::infinity();
     TokenId best_token = 0;

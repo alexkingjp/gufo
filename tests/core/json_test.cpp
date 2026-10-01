@@ -38,6 +38,17 @@ void TestNumbers() {
   }
   assert(Value(0).as_size(777) == 0);
   assert(Value(4096).as_size(777) == 4096);
+  for (const auto text : {"0.1", "1.00", "1e0", "10e-1", "-0.0", "1e-100"})
+    assert(parse(text).number_is_exact());
+  for (const auto text : {"1.0000000000000001", "9007199254740991.1",
+                          "0.100000000000000001", "9007199254740993"}) {
+    const auto value = parse(text);
+    assert(!value.number_is_exact());
+    assert(value.dump() == text);
+    assert(!parse(value.dump()).number_is_exact());
+    const auto copied = value;
+    assert(!copied.number_is_exact());
+  }
   const double largest = std::nextafter(std::ldexp(1.0, 64), 0.0);
   assert(Value(largest).as_size(777) == static_cast<std::size_t>(largest));
 

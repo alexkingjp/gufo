@@ -104,6 +104,25 @@ struct ChatTemplateOptions {
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
 };
 
+enum class ChatBoundaryKind : std::uint8_t {
+  kSystemEnd,
+  kLastUserStart,
+  kHistoryEnd,
+  kFullPrompt,
+};
+
+/// Byte positions emitted by the renderer, never inferred from message text.
+struct ChatByteBoundary {
+  ChatBoundaryKind kind;
+  std::size_t byte_offset{0};
+};
+
+/// Exact full-prompt token prefixes, possibly before a byte-boundary BPE join.
+struct ChatTokenBoundary {
+  ChatBoundaryKind kind;
+  std::size_t token_count{0};
+};
+
 /// Suffix opened for a new assistant turn, outside the stable conversation.
 [[nodiscard]] std::string_view GenerationPrompt(bool enable_thinking);
 
@@ -169,7 +188,15 @@ public:
   [[nodiscard]] static std::optional<std::string> Render(
       std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
       const ChatTemplateOptions& options = {}, std::string* error_msg = nullptr,
-      std::vector<std::size_t>* image_offsets = nullptr);
+      std::vector<std::size_t>* image_offsets = nullptr,
+      std::vector<ChatByteBoundary>* boundaries = nullptr);
+
+  /// Verify renderer offsets against complete tokenization. A merge spanning
+  /// an offset falls back to the earlier exact token prefix; zero is omitted.
+  [[nodiscard]] static std::vector<ChatTokenBoundary> VerifyTokenBoundaries(
+      const QwenTokenizer& tokenizer, std::string_view rendered,
+      std::span<const ChatByteBoundary> boundaries,
+      std::span<const TokenId> full_tokens);
 
   /// Formats messages and tokenizes the rendered prompt with the given
   /// tokenizer.

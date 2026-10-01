@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -443,6 +445,11 @@ public:
     return sizeof(FakeSnapshot);
   }
 
+  [[nodiscard]] std::size_t SnapshotAllocationBytes(
+      const TextRunnerState&) const override {
+    return sizeof(FakeSnapshot);
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
     ++stats_->snapshot_captures;
@@ -468,6 +475,7 @@ public:
 class PersistentSnapshotRunner final : public SnapshotRunner {
 public:
   std::function<void()> before_serialize;
+  bool fail_restore{false};
   PersistentSnapshotRunner(std::shared_ptr<FakeStats> stats,
                            std::string identity,
                            std::size_t retained_snapshot_capacity_bytes = 256)
@@ -517,6 +525,8 @@ public:
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
+    if (fail_restore)
+      throw std::runtime_error("injected disk restore failure");
     if (payload.size() != 4 * sizeof(std::uint64_t)) {
       throw std::invalid_argument("fake persistent payload size mismatch");
     }
@@ -1143,9 +1153,348 @@ void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
   extension.Invalidate();
 }
 
+// CPU state contains the actual executed tokens plus a recurrent checksum.
+// A later state cannot masquerade as an earlier boundary by resizing metadata.
+struct PrefixState final : TextRunnerState {
+  std::vector<TextRunnerToken> tokens;
+  std::uint64_t recurrent{0};
+  void Invalidate() noexcept override {
+    tokens.clear();
+    recurrent = 0;
+  }
+};
+
+struct PrefixSnapshot final : TextRunnerSnapshot {
+  std::vector<TextRunnerToken> tokens;
+  std::uint64_t recurrent;
+  PrefixSnapshot(const PrefixState& state)
+      : tokens(state.tokens), recurrent(state.recurrent) {}
+  std::size_t PayloadBytes() const noexcept override { return 128; }
+};
+
+class PrefixRunner final : public SnapshotRunner {
+public:
+  explicit PrefixRunner(std::shared_ptr<FakeStats> stats,
+                        std::size_t quantum = 4, std::size_t budget = 4096)
+      : SnapshotRunner(std::move(stats), 64, 256, budget), quantum(quantum) {}
+  std::size_t quantum;
+  mutable std::vector<std::size_t> captures;
+  std::size_t fail_at{0};
+
+  TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = SnapshotRunner::Descriptor();
+    descriptor.max_context = 131072;
+    descriptor.capabilities.prefix_checkpoint_alignment = quantum;
+    return descriptor;
+  }
+  std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<PrefixState>();
+  }
+  static void Append(PrefixState& state, TextRunnerToken token) {
+    state.tokens.push_back(token);
+    state.recurrent = state.recurrent * 131 + token;
+  }
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const auto& saved = dynamic_cast<const PrefixState&>(state);
+    PrefixState reference;
+    for (const auto token : prefix)
+      Append(reference, token);
+    Expect(std::ranges::equal(saved.tokens, prefix) &&
+               saved.recurrent == reference.recurrent,
+           "snapshot restores actual exact token and recurrent state");
+  }
+  TextPrefillStep Prefill(TextRunnerState& state,
+                          std::span<const TextRunnerToken> prompt,
+                          std::size_t offset,
+                          std::size_t limit) const override {
+    auto& current = dynamic_cast<PrefixState&>(state);
+    Expect(current.tokens.size() == offset, "prefill position is exact");
+    const auto count = std::min({quantum, limit, prompt.size() - offset});
+    stats_->prefill_spans.push_back(count);
+    for (const auto token : prompt.subspan(offset, count))
+      Append(current, token);
+    return {count, current.tokens.size() == prompt.size()};
+  }
+  TextDecodeSelection SelectNext(TextRunnerState& state,
+                                 gufo::sampling::SamplerState&) const override {
+    return {.token = static_cast<TextRunnerToken>(
+                dynamic_cast<PrefixState&>(state).recurrent % 100),
+            .piece = "x"};
+  }
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    Append(dynamic_cast<PrefixState&>(state), token);
+  }
+  std::size_t CheckpointPosition(const TextRunnerState& state) const override {
+    return dynamic_cast<const PrefixState&>(state).tokens.size();
+  }
+  std::size_t SnapshotPayloadBytes(const TextRunnerState&) const override {
+    return 128;
+  }
+  std::size_t SnapshotAllocationBytes(const TextRunnerState&) const override {
+    return 128;
+  }
+  std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& current = dynamic_cast<const PrefixState&>(state);
+    captures.push_back(current.tokens.size());
+    if (current.tokens.size() == fail_at)
+      throw std::runtime_error("injected boundary capture failure");
+    return std::make_unique<PrefixSnapshot>(current);
+  }
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    auto& current = dynamic_cast<PrefixState&>(state);
+    const auto& saved = dynamic_cast<const PrefixSnapshot&>(snapshot);
+    current.tokens = saved.tokens;
+    current.recurrent = saved.recurrent;
+  }
+};
+
+void FinishPrefill(TextRunnerPool::Request& request,
+                   std::size_t budget = 65536) {
+  while (!request.prefill_complete())
+    (void)request.Prefill(budget);
+}
+
+class DestructionRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+  mutable std::atomic<std::size_t> live{0};
+  mutable std::atomic<bool> constructed{false};
+  std::function<void()> on_destroy;
+  struct SnapshotPayload final : TextRunnerSnapshot {
+    const DestructionRunner* runner;
+    explicit SnapshotPayload(const DestructionRunner* owner) : runner(owner) {
+      runner->live += 8;
+      runner->constructed = true;
+    }
+    ~SnapshotPayload() override {
+      if (runner->on_destroy)
+        runner->on_destroy();
+      runner->live -= 8;
+    }
+    std::size_t PayloadBytes() const noexcept override { return 8; }
+  };
+  std::size_t SnapshotPayloadBytes(const TextRunnerState&) const override {
+    return 8;
+  }
+  std::size_t SnapshotAllocationBytes(const TextRunnerState&) const override {
+    return 8;
+  }
+  std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState&) const override {
+    return std::make_unique<SnapshotPayload>(this);
+  }
+};
+
+void TestInvalidationDestroysCaptureBeforeReleasingReservation() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<DestructionRunner>(stats, 64, 256, 8);
+  TextRunnerPool pool(runner, 2);
+  auto captured = pool.Acquire({1, 2, 3});
+  auto peer = pool.Acquire({9, 8});
+  FinishPrefill(captured);
+  FinishPrefill(peer);
+  bool checked = false;
+  runner->on_destroy = [&] {
+    checked = true;
+    Expect(runner->live == 8, "capture destructor begins with live allocation");
+    peer.CapturePromptSnapshot();
+    Expect(runner->live == 8,
+           "peer cannot spend reservation before capture destructor completes");
+  };
+  (void)captured.PreparePromptSnapshot();
+  while (!runner->constructed.load())
+    std::this_thread::yield();
+  while (captured.SnapshotPending())
+    std::this_thread::yield();
+  captured.Invalidate();
+  Expect(checked && runner->live == 0,
+         "completed future payload is destroyed before invalidation releases "
+         "lease");
+  runner->on_destroy = {};
+  peer.Invalidate();
+}
+
+void TestRamSemanticCheckpointAndIndependentBranches() {
+  using gufo::server::TextCacheBoundaryKind;
+  for (const std::size_t concurrency : {1, 2}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PrefixRunner>(stats);
+    TextRunnerPool pool(runner, concurrency);
+    const std::vector<TextRunnerToken> prompt{1, 2, 3,  4,  5,  6, 7,
+                                              8, 9, 10, 11, 12, 13};
+    auto root = pool.Acquire(prompt, {}, {}, {}, true, 0, {},
+                             {{TextCacheBoundaryKind::kSystemEnd, 5},
+                              {TextCacheBoundaryKind::kLastUserStart, 10},
+                              {TextCacheBoundaryKind::kHistoryEnd, 12},
+                              {TextCacheBoundaryKind::kFullPrompt, 13}});
+    (void)root.Prefill(65536);
+    (void)root.Prefill(65536);
+    root.CapturePromptSnapshot();
+    Expect(runner->captures == std::vector<std::size_t>{8},
+           "one selected semantic tap aligns to an existing frontier");
+    auto branch_tokens = prompt;
+    branch_tokens[9] = 99;
+    TextRunnerPool::Request branch;
+    if (concurrency == 2) {
+      branch = pool.Acquire(branch_tokens);
+      Expect(branch.cached_prompt_tokens() == 8,
+             "C2 forks published early snapshot before root commit");
+    }
+    FinishPrefill(root);
+    const auto selected = root.SelectNext();
+    root.Advance();
+    const auto metrics = root.Commit();
+    Expect(metrics.prefix_checkpoint_tokens == 8 &&
+               metrics.prefix_checkpoint_kind ==
+                   TextCacheBoundaryKind::kLastUserStart &&
+               metrics.prefix_checkpoint_bytes == 128 &&
+               metrics.snapshot_bytes == 128,
+           "early and regular snapshots publish on the same lease");
+    if (concurrency == 1) {
+      auto live_tokens = prompt;
+      live_tokens.push_back(selected.token);
+      live_tokens.push_back(77);
+      auto live = pool.Acquire(live_tokens);
+      Expect(
+          live.cached_prompt_tokens() == 14 && live.cache_restore_bytes() == 0,
+          "early checkpoint preserves copy-free live extension");
+      live.Invalidate();
+      branch = pool.Acquire(branch_tokens);
+      Expect(branch.cached_prompt_tokens() == 8,
+             "C1 edited final user restores the earlier actual state");
+    }
+    FinishPrefill(branch);
+    branch.Commit();
+    auto replay = pool.Acquire(prompt);
+    Expect(replay.cached_prompt_tokens() == prompt.size(),
+           "regular full prompt still supports exact replay");
+  }
+}
+
+void TestRamLearns33542WithoutDisk() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PrefixRunner>(stats, 2048);
+  TextRunnerPool pool(runner, 1);
+  std::vector<TextRunnerToken> first(34000, 7);
+  auto request = pool.Acquire(first);
+  FinishPrefill(request);
+  request.Commit();
+  auto second = first;
+  second[33542] = 9;
+  request = pool.Acquire(second);
+  Expect(!request.cache_hit() &&
+             request.cache_lookup().common_prefix_tokens == 33542,
+         "diagnostic LCP is not itself a restorable checkpoint");
+  FinishPrefill(request);
+  const auto metrics = request.Commit();
+  Expect(metrics.prefix_checkpoint_tokens == 32768 &&
+             metrics.prefix_checkpoint_kind ==
+                 gufo::server::TextCacheBoundaryKind::kLearnedPrefix &&
+             metrics.prefix_checkpoint_bytes == 128 &&
+             runner->captures == std::vector<std::size_t>{34000, 32768, 34000},
+         "opportunistic RAM training captures one existing 2048 frontier");
+  auto third = first;
+  third[33542] = 10;
+  request = pool.Acquire(third);
+  Expect(
+      request.cached_prompt_tokens() == 32768 && !request.cache_disk_hit(),
+      "third branch restores learned exact RAM checkpoint without persistence");
+}
+
+void TestEarlyBudgetFailureCancellationAndNoSplit() {
+  using gufo::server::TextCacheBoundaryKind;
+  const std::vector<TextRunnerToken> prompt{1, 2, 3,  4,  5,  6, 7,
+                                            8, 9, 10, 11, 12, 13};
+  for (const bool fail : {false, true}) {
+    auto runner = std::make_shared<PrefixRunner>(std::make_shared<FakeStats>(),
+                                                 4, fail ? 4096 : 128);
+    if (fail)
+      runner->fail_at = 8;
+    TextRunnerPool pool(runner, 1);
+    auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, {},
+                                {{TextCacheBoundaryKind::kLastUserStart, 10}});
+    FinishPrefill(request);
+    const auto metrics = request.Commit();
+    Expect(
+        metrics.snapshot_bytes == 128 && metrics.prefix_checkpoint_bytes == 0,
+        "early refusal/failure leaves regular snapshot and successful request");
+    Expect(metrics.prefix_checkpoint_failures == (fail ? 1 : 0),
+           "capture failure is separately counted");
+    Expect(runner->captures.size() == (fail ? 2 : 1),
+           "tiny budget refuses early allocation before capture");
+  }
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PrefixRunner>(stats);
+    TextRunnerPool pool(runner, 1);
+    auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, {},
+                                {{TextCacheBoundaryKind::kSystemEnd, 8}});
+    FinishPrefill(request, 3);
+    request.Commit();
+    Expect(runner->captures == std::vector<std::size_t>{13} &&
+               stats->prefill_spans == std::vector<std::size_t>{3, 3, 3, 3, 1},
+           "crossed early tap is skipped rather than reshape ordinary prefill");
+  }
+  {
+    auto runner = std::make_shared<PrefixRunner>(std::make_shared<FakeStats>());
+    TextRunnerPool pool(runner, 1);
+    auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, {},
+                                {{TextCacheBoundaryKind::kSystemEnd, 8}});
+    (void)request.Prefill(4);
+    (void)request.Prefill(4);
+    const auto metrics = request.Cancel();
+    Expect(
+        metrics.prefix_checkpoint_bytes == 128 && runner->captures.size() == 1,
+        "cancellation joins existing early capture without copying partial "
+        "prompt");
+    auto changed = prompt;
+    changed[9] = 99;
+    auto next = pool.Acquire(changed);
+    Expect(next.cached_prompt_tokens() == 8,
+           "completed early snapshot survives cancellation of later work");
+  }
+}
+
+void TestLongerDiskPrefixWinsOverShortRamCheckpoint() {
+  for (const bool fail_restore : {false, true}) {
+    TemporaryDirectory directory;
+    const TextRunnerDiskCacheOptions disk{.directory = directory.path(),
+                                          .capacity_bytes = 8192,
+                                          .staging_capacity_bytes = 4096};
+    auto stats = std::make_shared<FakeStats>();
+    auto runner =
+        std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
+    {
+      TextRunnerPool writer(runner, 1, disk);
+      auto request = writer.Acquire({1, 2, 3, 4, 5, 6});
+      FinishPrefill(request);
+      request.Commit();
+    }
+    TextRunnerPool pool(runner, 1, disk);
+    auto shorter = pool.Acquire({1, 2});
+    FinishPrefill(shorter);
+    shorter.Commit();
+    runner->fail_restore = fail_restore;
+    auto longer = pool.Acquire({1, 2, 3, 4, 5, 6, 7});
+    Expect(
+        longer.cache_disk_hit() == !fail_restore &&
+            longer.cached_prompt_tokens() == (fail_restore ? 2 : 6),
+        "short exact RAM checkpoint cannot shadow a longer exact disk prefix");
+  }
+}
+
 }  // namespace
 
 int main() {
+  TestInvalidationDestroysCaptureBeforeReleasingReservation();
+  TestRamSemanticCheckpointAndIndependentBranches();
+  TestRamLearns33542WithoutDisk();
+  TestEarlyBudgetFailureCancellationAndNoSplit();
+  TestLongerDiskPrefixWinsOverShortRamCheckpoint();
   TestGeneratedFrontierForksBeforeMutation();
   TestGeneratedFrontierPersistsForForks();
   TestCancellationRetainsOnlyCompletedWork();

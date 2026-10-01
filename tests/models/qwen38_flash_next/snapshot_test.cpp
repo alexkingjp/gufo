@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -62,6 +63,39 @@ void RequireSame(const Decoded& expected, const Decoded& actual,
           what + ": draft acceptance differs");
 }
 
+std::uint64_t UniqueBytes(
+    std::initializer_list<const qfn::SessionSnapshot*> snapshots) {
+  std::map<std::shared_ptr<const void>, std::size_t, std::owner_less<>> owners;
+  for (const auto* snapshot : snapshots) {
+    for (const auto& owner : snapshot->StorageOwners()) {
+      const auto [it, inserted] = owners.emplace(owner.owner, owner.bytes);
+      Require(inserted || it->second == owner.bytes,
+              "physical owner charge changed between snapshots");
+    }
+  }
+  std::uint64_t bytes = 0;
+  for (const auto& [identity, size] : owners) {
+    Require(identity != nullptr && size != 0, "empty storage owner");
+    bytes += size;
+  }
+  return bytes;
+}
+
+std::vector<std::uint8_t> SnapshotBytes(const qfn::SessionSnapshot& snapshot) {
+  std::vector<std::uint8_t> bytes(snapshot.SizeBytes());
+  Require(snapshot.CopyTo(bytes), "snapshot serialization failed");
+  return bytes;
+}
+
+void RequireShared(const qfn::SessionSnapshot& parent,
+                   const qfn::SessionSnapshot& child) {
+  const auto shared = UniqueBytes({&parent}) + UniqueBytes({&child}) -
+                      UniqueBytes({&parent, &child});
+  Require(shared != 0,
+          "same-lineage checkpoint did not share physical storage");
+  std::cout << "snapshot_shared_physical_bytes=" << shared << '\n';
+}
+
 double Millis(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration<double, std::milli>(
              std::chrono::steady_clock::now() - start)
@@ -114,6 +148,8 @@ int main(int argc, char** argv) {
     const double save_ms = Millis(start);
     Require(at_prompt->SizeBytes() == origin->SnapshotBytes(),
             "snapshot size differs from the estimate");
+    Require(UniqueBytes({at_prompt.get()}) <= origin->SnapshotAllocationBytes(),
+            "physical snapshot exceeds allocation reservation");
     std::cout << "snapshot tokens=" << prompt.size()
               << " bytes=" << at_prompt->SizeBytes() << " save_ms=" << save_ms
               << "\n";
@@ -143,6 +179,15 @@ int main(int argc, char** argv) {
     // The persistent byte form restores the same way.
     std::vector<std::uint8_t> bytes(at_prompt->SizeBytes());
     Require(at_prompt->CopyTo(bytes), "snapshot copy");
+    std::size_t streamed = 0;
+    at_prompt->StreamTo([&](auto part) {
+      Require(part.size() <= bytes.size() - streamed &&
+                  std::memcmp(bytes.data() + streamed, part.data(),
+                              part.size()) == 0,
+              "streaming serialization differs from contiguous bytes");
+      streamed += part.size();
+    });
+    Require(streamed == bytes.size(), "streaming serialization truncated");
     auto persisted = model->CreateSession(
         model->HasMtp() ? gufo::core::SessionMode::kSpeculative
                         : gufo::core::SessionMode::kAutoregressive,
@@ -170,6 +215,21 @@ int main(int argc, char** argv) {
     const Decoded first_half = Decode(*origin, 16, config, 8);
     auto mid = origin->SaveSnapshot(&error);
     Require(mid != nullptr, error);
+    RequireShared(*at_prompt, *mid);
+    Require(UniqueBytes({mid.get()}) <= origin->SnapshotAllocationBytes(),
+            "shared snapshot exceeds conservative allocation reservation");
+    // Compare every actual segmented byte with a full fresh recapture after
+    // persistent restore has invalidated the capture lineage.
+    const auto mid_bytes = SnapshotBytes(*mid);
+    Require(restored->RestoreSnapshot(mid_bytes, &error), error);
+    auto independent = restored->SaveSnapshot(&error);
+    Require(independent && SnapshotBytes(*independent) == mid_bytes,
+            "shared capture differs from independent full recapture");
+    Require(
+        UniqueBytes({at_prompt.get(), independent.get()}) ==
+            UniqueBytes({at_prompt.get()}) + UniqueBytes({independent.get()}),
+        "persistent restore reused stale in-memory lineage");
+    independent.reset();
     const Decoded second_half = Decode(*origin, kTokens, config, 8);
     Require(restored->RestoreSnapshot(*mid, &error), error);
     Require(restored->Position() == prompt.size() + first_half.tokens.size(),
@@ -218,6 +278,34 @@ int main(int argc, char** argv) {
     Require(std::memcmp(origin->Logits().data(), restored->Logits().data(),
                         prompt_logits.size() * sizeof(float)) == 0,
             "extension after restore differs");
+
+    // A historical restore forks from that exact checkpoint, not from the
+    // most recent captured descendant that happens to share its token prefix.
+    auto branch_tokens = prompt;
+    branch_tokens.push_back((expected.tokens.front() + 1) % model->VocabSize());
+    Require(origin->RestoreSnapshot(*at_prompt, &error) &&
+                origin->Sync(branch_tokens, &error),
+            error);
+    auto branch = origin->SaveSnapshot(&error);
+    Require(branch != nullptr, error);
+    RequireShared(*at_prompt, *branch);
+    Require(
+        SnapshotBytes(*mid) == mid_bytes && SnapshotBytes(*at_prompt) == bytes,
+        "branch capture mutated an immutable ancestor or sibling");
+    const auto branch_bytes = SnapshotBytes(*branch);
+    Require(persisted->RestoreSnapshot(branch_bytes, &error), error);
+    independent = persisted->SaveSnapshot(&error);
+    Require(independent && SnapshotBytes(*independent) == branch_bytes,
+            "forked shared history differs from independent capture");
+    independent.reset();
+    // Reset must disable sharing even when the next run evaluates exact tokens.
+    origin->Reset();
+    Require(origin->Sync(std::span(prompt).first(16), &error), error);
+    auto after_reset = origin->SaveSnapshot(&error);
+    Require(after_reset && UniqueBytes({after_reset.get(), at_prompt.get()}) ==
+                               UniqueBytes({after_reset.get()}) +
+                                   UniqueBytes({at_prompt.get()}),
+            "reset retained stale capture lineage");
 
     // Cached state from older prefill arithmetic must be rebuilt.
     auto incompatible = bytes;

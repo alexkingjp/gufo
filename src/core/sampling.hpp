@@ -3,14 +3,78 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include "src/core/json_constraint.hpp"
 
 namespace gufo::sampling {
 
 using TokenId = std::uint32_t;
+
+/// Immutable tokenizer binding shared by requests, never a decoding cursor.
+class TokenConstraint {
+public:
+  struct Piece {
+    std::string bytes;
+    bool stop{false};
+    bool special{false};
+  };
+  using Vocabulary = std::vector<Piece>;
+  struct Options {
+    bool starts_in_reasoning{false};
+    bool allow_tool_calls{false};
+    bool require_tool_call{false};
+  };
+  struct Cursor {
+    enum class Phase {
+      kReasoning,
+      kAnswerStart,
+      kJson,
+      kToolStart,
+      kToolBody,
+      kAfterTool
+    };
+    JsonConstraint grammar;
+    Phase phase;
+    std::string pending;
+    enum class ToolPhase {
+      kStart,
+      kJson,
+      kFunctionPrefix,
+      kFunctionName,
+      kBetweenParameters,
+      kParameterName,
+      kParameterBody,
+      kClose
+    };
+    ToolPhase tool_phase{ToolPhase::kStart};
+    std::vector<char> json_closers;
+    bool json_string{false};
+    bool json_escape{false};
+  };
+
+  TokenConstraint(std::shared_ptr<const JsonConstraint> prototype,
+                  std::shared_ptr<const Vocabulary> vocabulary);
+  TokenConstraint(std::shared_ptr<const JsonConstraint> prototype,
+                  std::shared_ptr<const Vocabulary> vocabulary,
+                  Options options);
+  [[nodiscard]] Cursor Start() const;
+  [[nodiscard]] bool Complete(const Cursor& cursor) const;
+  [[nodiscard]] bool Allows(const Cursor& cursor, TokenId token) const;
+  void Accept(Cursor& cursor, TokenId token) const;
+
+private:
+  void Advance(Cursor& cursor, std::string_view bytes) const;
+  void AdvanceToolBody(Cursor& cursor, char byte) const;
+  std::shared_ptr<const JsonConstraint> prototype_;
+  std::shared_ptr<const Vocabulary> vocabulary_;
+  Options options_;
+};
 
 /// Model-independent controls for selecting a token from a logit row.
 ///
@@ -82,7 +146,8 @@ private:
 class SamplerState {
 public:
   explicit SamplerState(SamplingConfig config = {},
-                        std::span<const TokenId> initial_history = {});
+                        std::span<const TokenId> initial_history = {},
+                        std::shared_ptr<const TokenConstraint> constraint = {});
   ~SamplerState() = default;
   SamplerState(const SamplerState& other);
   SamplerState& operator=(const SamplerState& other);
@@ -99,6 +164,10 @@ public:
   void SetRngState(std::uint64_t state) noexcept;
   /// Publish RNG and any deferred draw without accepting tentative history.
   void CopyDrawStateFrom(const SamplerState& other) noexcept;
+  /// Attaching a grammar starts a new cursor and discards a deferred draw.
+  void SetConstraint(std::shared_ptr<const TokenConstraint> constraint);
+  [[nodiscard]] bool has_constraint() const noexcept;
+  [[nodiscard]] bool constraint_complete() const;
   struct DrawState {
     std::uint64_t rng;
     std::optional<TokenId> pending;
@@ -137,6 +206,9 @@ private:
   void RebuildPenaltyCounts();
   [[nodiscard]] double AdjustedLogit(TokenId token, float logit) const noexcept;
   [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
+  [[nodiscard]] TokenId SampleConstrainedGreedy(
+      std::span<const float> logits,
+      std::span<const TokenId> token_ids = {}) const;
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
@@ -147,6 +219,8 @@ private:
   std::vector<Probability> candidate_scratch_;
   std::uint64_t rng_state_{0};
   std::optional<TokenId> pending_sample_;
+  std::shared_ptr<const TokenConstraint> constraint_;
+  std::unique_ptr<TokenConstraint::Cursor> constraint_cursor_;
 };
 
 [[nodiscard]] std::uint64_t NextRandom(std::uint64_t* state);

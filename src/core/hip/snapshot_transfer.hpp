@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <stdexcept>
 
+#include "src/core/hip/wait_policy.hpp"
+
 namespace gufo::hip {
 
 /// Copies a frozen session on a separate stream. Callers have completed that
@@ -26,7 +28,7 @@ public:
   void Copy(void* destination, const void* source, std::size_t bytes,
             hipMemcpyKind kind = hipMemcpyDeviceToHost) {
     Check(hipMemcpyAsync(destination, source, bytes, kind, stream_));
-    Check(hipStreamSynchronize(stream_));
+    WaitStreamThrow(stream_);
   }
 
   void Copy2D(void* destination, std::size_t destination_pitch,
@@ -34,7 +36,7 @@ public:
               std::size_t height, hipMemcpyKind kind = hipMemcpyDeviceToHost) {
     Check(hipMemcpy2DAsync(destination, destination_pitch, source, source_pitch,
                            width, height, kind, stream_));
-    Check(hipStreamSynchronize(stream_));
+    WaitStreamThrow(stream_);
   }
 
 private:

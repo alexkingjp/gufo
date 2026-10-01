@@ -154,6 +154,11 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
                     std::size_t batch, std::size_t m, std::size_t k,
                     hipStream_t stream);
 
+/// Wave32 retile of the same prefill shape; selected by GUFO_WAVE32_MOE=1.
+void W8A8GemmWave32(const void* w, const void* x_tiled, float* out,
+                    std::size_t batch, std::size_t m, std::size_t k,
+                    hipStream_t stream);
+
 /// Q8_0 HC down projection [320,10240], SiLU(x / 4), then F16 output.
 /// Matches the separate operators' rounding. Supports at least 96 tokens.
 bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
@@ -363,6 +368,13 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
 void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
              hipStream_t stream);
+
+/// Quantizes f32 rows into the packed q8_0 store (kv_quant.hpp) at
+/// positions start_pos + t; row_dim must be a multiple of 32 and each
+/// store row holds kv_quant::RowBytes(row_dim) bytes.
+void QuantizeKv(const float* src, std::byte* store, std::uint32_t n_tokens,
+                std::uint32_t row_dim, const std::uint32_t* start_pos,
+                hipStream_t stream);
 /// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -398,12 +410,12 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// Per-token attention (decode and narrow batches). With `partials`
 /// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split
 /// across `splits` blocks per row and merged in a second launch.
-void Attention(const float* q, const __half* k_cache, const __half* v_cache,
-               const std::uint32_t* mask, std::uint32_t mask_words, float* out,
-               float* partials, std::uint32_t splits, std::uint32_t n_tokens,
-               const std::uint32_t* start_pos, std::uint32_t heads,
-               std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream);
+void Attention(const float* q, const void* k_cache, const void* v_cache,
+               bool q8, const std::uint32_t* mask, std::uint32_t mask_words,
+               float* out, float* partials, std::uint32_t splits,
+               std::uint32_t n_tokens, const std::uint32_t* start_pos,
+               std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
+               std::uint32_t ratio, hipStream_t stream);
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows
@@ -412,7 +424,7 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
 bool WmmaCausalAttention(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
+                         const void* k_cache, const void* v_cache, bool q8,
                          const std::uint32_t* mask, std::uint32_t mask_words,
                          float* out, std::uint32_t n_tokens,
                          std::uint32_t start_pos, std::uint32_t heads,

@@ -256,6 +256,123 @@ void CheckBatchProfitability() {
   Require(policy.Choose(rows, 0) <= 1, "invalid timing corrupted policy");
 }
 
+void CheckSingleProfitability() {
+  qfn::MtpLengthController acceptance(7);
+  auto state = acceptance.State();
+  state.successes.fill(6.0F);
+  state.failures.fill(4.0F);
+  state.explored_depth = 7;
+  state.failed_depths = 127;
+  Require(acceptance.Restore(state), "C1 acceptance state rejected");
+  qfn::MtpBatchController policy;
+  qfn::MtpBatchController::Row row{&acceptance, 7};
+  const auto rows = std::span(&row, 1);
+  for (unsigned width = 0; width <= 7; ++width) {
+    const float cost = width == 0   ? 40.0F
+                       : width == 1 ? 48.0F
+                                    : 180.0F + 40.0F * width;
+    for (unsigned repeat = 0; repeat < 3; ++repeat)
+      policy.Observe(1, 0, width, cost);
+  }
+  Require(policy.Choose(rows, 0) == 1,
+          "C1 ignored measured cost of wider verification");
+  Require(policy.Choose(rows, 32768) > 1,
+          "C1 deep context inherited shallow measured costs");
+  policy.Observe(1, 0, 2, 1.0F);
+  Require(policy.Choose(rows, 0) == 1,
+          "C1 transition timing replaced a steady cycle cost");
+  for (const float invalid :
+       {0.0F, -1.0F, std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity()}) {
+    policy.Observe(1, 0, 2, invalid);
+    Require(policy.Choose(rows, 0) == 1,
+            "invalid C1 timing changed the selected width");
+  }
+
+  // A new perfect request must explore despite model-wide measurements from
+  // earlier mixed work. Its fully accepted prefixes are censored, not failures.
+  acceptance.Reset();
+  for (unsigned width : {1U, 2U, 4U}) {
+    acceptance.Observe(width, width);
+    Require(policy.Choose(rows, 0) == std::min(2 * width, 7U),
+            "prior C1 costs suppressed a new request's perfect-chain probe");
+  }
+  row.budget = 3;
+  Require(policy.Choose(rows, 0) == 3, "C1 probe exceeded remaining budget");
+  row.budget = 0;
+  Require(policy.Choose(rows, 0) == 0, "C1 ignored an empty draft budget");
+  row.budget = 7;
+  acceptance.Observe(7, 7);
+  Require(policy.Choose(rows, 0) == 1,
+          "C1 retained an expensive perfect chain after its bounded probe");
+  for (unsigned cycle = 0; cycle < 16; ++cycle) {
+    acceptance.Observe(1, 1);
+    Require(policy.Choose(rows, 0) == 1,
+            "C1 repeated a fully explored perfect-chain probe too soon");
+  }
+  acceptance.Observe(1, 1);
+  Require(policy.Choose(rows, 0) == 2,
+          "C1 failed to retry a bounded perfect-chain probe");
+
+  // Runtime cost learning must not mutate the acceptance state saved for
+  // deterministic sampled replay.
+  qfn::MtpLengthController replay(7);
+  Require(replay.Restore(acceptance.State()), "C1 acceptance replay failed");
+  for (unsigned width = 0; width <= 7; ++width)
+    for (unsigned repeat = 0; repeat < 3; ++repeat)
+      policy.Observe(1, 0, width, width == 0 ? 40.0F : 1000.0F);
+  for (unsigned budget = 0; budget <= 8; ++budget)
+    Require(acceptance.Choose(budget) == replay.Choose(budget),
+            "measured C1 timings changed deterministic sampled policy");
+
+  qfn::MtpBatchController fresh_policy;
+  acceptance.Reset();
+  unsigned full_width = 0, plain_controls = 0;
+  const auto costs = qfn::MtpCycleCosts(32768, 1);
+  for (unsigned cycle = 0; cycle < 96; ++cycle) {
+    const auto width = fresh_policy.Choose(rows, 32768);
+    if (width == 0)
+      acceptance.ObserveArToken();
+    else
+      acceptance.Observe(width, width, 32768);
+    fresh_policy.Observe(1, 32768, width, costs[width]);
+    if (cycle >= 32) {
+      full_width += width == 7;
+      plain_controls += width == 0;
+    }
+  }
+  Require(full_width >= 56 && plain_controls > 0,
+          "measured C1 control lost sustained perfect-acceptance throughput");
+}
+
+void CheckSingleCostIsolation() {
+  qfn::MtpLengthController acceptance(7);
+  qfn::MtpBatchController first, second, clean;
+  const qfn::MtpBatchController::Row row{&acceptance, 7};
+  const auto rows = std::span(&row, 1);
+  for (unsigned width = 0; width <= 7; ++width)
+    for (unsigned repeat = 0; repeat < 3; ++repeat)
+      first.Observe(1, 0, width, width == 0 ? 40.0F : 1000.0F);
+  Require(first.Choose(rows, 0) == 0 && second.Choose(rows, 0) > 0,
+          "independent C1 requests shared measured costs");
+  for (unsigned width = 0; width <= 7; ++width)
+    for (unsigned repeat = 0; repeat < 3; ++repeat)
+      second.Observe(1, 32768, width, width == 0 ? 40.0F : 1000.0F);
+  first.Reset();
+  for (unsigned context : {0, 4096, 32768, 131072})
+    Require(first.Choose(rows, context) == clean.Choose(rows, context),
+            "C1 reset retained costs, exploration phase or cohort history");
+  Require(second.Choose(rows, 32768) == 0,
+          "resetting one C1 request erased another request's costs");
+  for (unsigned cycle = 0; cycle < 24; ++cycle) {
+    const auto chosen = first.Choose(rows, 0);
+    Require(chosen == clean.Choose(rows, 0),
+            "reset C1 controller differs from fresh controller");
+    first.Observe(1, 0, chosen, 40.0F + 10.0F * chosen);
+    clean.Observe(1, 0, chosen, 40.0F + 10.0F * chosen);
+  }
+}
+
 void CheckSampledOutputFrequencies() {
   const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
   qfn::MtpCandidateLogits candidates;
@@ -336,6 +453,8 @@ int main() {
     CheckLengthController();
     CheckCalibratedCosts();
     CheckBatchProfitability();
+    CheckSingleProfitability();
+    CheckSingleCostIsolation();
     CheckCompactProposals();
     CheckSampledOutputFrequencies();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};

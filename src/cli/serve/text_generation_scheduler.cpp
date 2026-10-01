@@ -6,12 +6,15 @@
 #include <deque>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 namespace gufo::server {
@@ -56,6 +59,8 @@ struct ScheduledRequest {
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
   std::shared_ptr<const TextPromptContext> prompt_context;
+  std::shared_ptr<const sampling::TokenConstraint> json_constraint;
+  std::vector<TextCacheBoundary> cache_boundaries;
   bool cache_prompt{true};
   std::size_t cache_prefix_tokens{0};
   std::size_t token_limit{1};
@@ -64,6 +69,16 @@ struct ScheduledRequest {
   bool publish_token_pieces{false};
   TextGenerationScheduler::Clock::time_point request_start;
   std::optional<TextGenerationScheduler::Clock::time_point> deadline;
+  std::optional<TextGenerationScheduler::Clock::time_point> queue_deadline;
+  TextGenerationScheduler::ClockSource clock;
+  TextGenerationScheduler::Clock::time_point submitted_at;
+  std::optional<TextGenerationScheduler::Clock::time_point> admitted_at;
+  std::optional<TextGenerationScheduler::Clock::time_point> decode_ready_at;
+  std::optional<TextGenerationScheduler::Clock::time_point> wait_start;
+  bool waiting_for_snapshot{false};
+  std::size_t admission_bypasses{0};
+  std::size_t reserved_prefill_tokens{0};
+  bool accounted{false};
   std::size_t max_output_bytes{0};
   std::size_t max_buffered_output_bytes{0};
   std::shared_ptr<OutputBudget> output_budget;
@@ -164,7 +179,7 @@ bool CancellationRequested(const std::shared_ptr<ScheduledRequest>& request) {
 
 bool DeadlineExceeded(const std::shared_ptr<ScheduledRequest>& request) {
   return request->deadline.has_value() &&
-         TextGenerationScheduler::Clock::now() >= *request->deadline;
+         request->clock() >= *request->deadline;
 }
 
 }  // namespace
@@ -180,17 +195,23 @@ struct TextGenerationScheduler::Request::Impl {
 struct TextGenerationScheduler::Impl {
   Impl(std::shared_ptr<TextRunnerPool> model_runner_pool,
        TextPrefillPolicy model_prefill_policy,
-       TextSchedulerPolicy model_scheduler_policy)
+       TextSchedulerPolicy model_scheduler_policy, ClockSource clock_source)
       : runner_pool(std::move(model_runner_pool)),
         prefill_policy(model_prefill_policy),
         scheduler_policy(model_scheduler_policy),
+        clock(std::move(clock_source)),
         output_budget(std::make_shared<OutputBudget>(
             model_scheduler_policy.max_buffered_output_bytes_total)) {
     if (runner_pool == nullptr) {
       throw std::invalid_argument(
           "text generation scheduler runner pool must not be null");
     }
-    if (prefill_policy.decode_active_tokens == 0) {
+    if (!clock || prefill_policy.decode_active_tokens == 0 ||
+        prefill_policy.target_chunk_time.count() <= 0 ||
+        prefill_policy.min_chunk_tokens == 0 ||
+        prefill_policy.min_chunk_tokens >
+            std::min(prefill_policy.decode_active_tokens,
+                     kDefaultDecodeActivePrefillTokens)) {
       throw std::invalid_argument(
           "active-decode prefill budget must be at least one token");
     }
@@ -201,7 +222,11 @@ struct TextGenerationScheduler::Impl {
         scheduler_policy.max_output_bytes_per_request == 0 ||
         scheduler_policy.max_buffered_output_bytes_per_request == 0 ||
         scheduler_policy.max_buffered_output_bytes_total == 0 ||
-        scheduler_policy.request_timeout.count() < 0) {
+        scheduler_policy.request_timeout.count() < 0 ||
+        scheduler_policy.decode_burst.count() < 0 ||
+        scheduler_policy.queue_timeout.count() < 0 ||
+        scheduler_policy.admission_aging.count() < 0 ||
+        scheduler_policy.max_decode_steps_per_burst == 0) {
       throw std::invalid_argument("invalid text scheduler limits");
     }
     incremental_prefill_supported =
@@ -248,8 +273,83 @@ struct TextGenerationScheduler::Impl {
     if (queued_clients.empty()) {
       return {};
     }
-    auto client = std::move(queued_clients.front());
-    queued_clients.pop_front();
+    auto selected = queued_clients.begin();
+    // Lineage-sticky admission: a queued request whose input identity
+    // matches a free slot's resident continuation adopts that slot without
+    // any restore, and the conversation keeps serving its live state in
+    // place. Bounded: after capacity() consecutive sticky admissions one
+    // unrelated head goes through, so nothing starves.
+    bool sticky_pop = false;
+    if (scheduler_policy.sticky_admission &&
+        sticky_admission_run < runner_pool->capacity()) {
+      const auto lineages = runner_pool->FreeSlotLineages();
+      if (!lineages.empty()) {
+        auto match = queued_clients.end();
+        std::size_t match_live = 0;
+        for (auto candidate = queued_clients.begin();
+             candidate != queued_clients.end(); ++candidate) {
+          const auto& head = candidate->requests.front();
+          if (head->prompt_context == nullptr)
+            continue;
+          const auto& identity = head->prompt_context->cache_identity;
+          if (identity.empty())
+            continue;
+          for (const auto& lineage : lineages) {
+            if (lineage.live_tokens > match_live &&
+                lineage.identity.size() == identity.size() &&
+                std::equal(identity.begin(), identity.end(),
+                           lineage.identity.begin())) {
+              match = candidate;
+              match_live = lineage.live_tokens;
+              break;
+            }
+          }
+        }
+        if (match != queued_clients.end()) {
+          selected = match;
+          sticky_pop = true;
+        }
+      }
+    }
+    if (sticky_pop) {
+      ++sticky_admission_run;
+    } else {
+      sticky_admission_run = 0;
+    }
+    if (scheduler_policy.prefer_short_prefill) {
+      const auto now = clock();
+      auto forced = queued_clients.end();
+      for (auto candidate = queued_clients.begin();
+           candidate != queued_clients.end(); ++candidate) {
+        const auto& request = candidate->requests.front();
+        const bool aged =
+            scheduler_policy.admission_aging.count() > 0 &&
+            now - request->submitted_at >= scheduler_policy.admission_aging;
+        if (aged || request->admission_bypasses >=
+                        scheduler_policy.max_admission_bypasses) {
+          if (forced == queued_clients.end() ||
+              request->id < forced->requests.front()->id)
+            forced = candidate;
+        }
+        // Only compare client heads: short jobs cannot jump their own FIFO.
+        const auto cost = request->result.estimated_prefill_tokens.value_or(
+            request->result.prompt_tokens);
+        const auto best = selected->requests.front();
+        if (cost < best->result.estimated_prefill_tokens.value_or(
+                       best->result.prompt_tokens))
+          selected = candidate;
+      }
+      if (forced != queued_clients.end())
+        selected = forced;
+      for (auto& client : queued_clients) {
+        auto& head = client.requests.front();
+        if (head != selected->requests.front() &&
+            head->admission_bypasses < scheduler_policy.max_admission_bypasses)
+          ++head->admission_bypasses;
+      }
+    }
+    auto client = std::move(*selected);
+    queued_clients.erase(selected);
     auto request = std::move(client.requests.front());
     client.requests.pop_front();
     --queued_count;
@@ -291,6 +391,98 @@ struct TextGenerationScheduler::Impl {
     return snapshot;
   }
 
+  static double Milliseconds(Clock::duration duration) {
+    return std::max(
+        0.0, std::chrono::duration<double, std::milli>(duration).count());
+  }
+
+  void AccountWait(const std::shared_ptr<ScheduledRequest>& request) {
+    if (!request->wait_start)
+      return;
+    const double elapsed = Milliseconds(clock() - *request->wait_start);
+    if (request->waiting_for_snapshot)
+      request->result.snapshot_wait_ms += elapsed;
+    else
+      request->result.resident_wait_ms += elapsed;
+    request->wait_start.reset();
+  }
+
+  void BeginWork(const std::shared_ptr<ScheduledRequest>& request) {
+    AccountWait(request);
+    request->waiting_for_snapshot = false;
+  }
+
+  void EndWork(const std::shared_ptr<ScheduledRequest>& request) {
+    if (IsTerminal(request))
+      return;
+    request->wait_start = clock();
+    request->waiting_for_snapshot = request->runner_request.SnapshotPending();
+    if (request->runner_request.prefill_complete() && !request->decode_ready_at)
+      request->decode_ready_at = clock();
+  }
+
+  void ReservePrefill(const std::shared_ptr<ScheduledRequest>& request,
+                      std::size_t tokens) {
+    const std::lock_guard<std::mutex> lock(queue_mutex);
+    reserved_prefill_tokens -= request->reserved_prefill_tokens;
+    request->reserved_prefill_tokens = tokens;
+    reserved_prefill_tokens += tokens;
+  }
+
+  void FinalizeTiming(const std::shared_ptr<ScheduledRequest>& request) {
+    AccountWait(request);
+    const auto now = clock();
+    request->result.queue_ms = request->result.queue_admission_ms =
+        Milliseconds(request->admitted_at.value_or(now) -
+                     request->request_start);
+    request->result.total_generation_wall_ms =
+        Milliseconds(now - request->request_start);
+    if (request->decode_ready_at)
+      request->result.decode_wall_ms =
+          Milliseconds(now - *request->decode_ready_at);
+    const std::lock_guard<std::mutex> lock(queue_mutex);
+    if (request->accounted) {
+      --inflight_count;
+      auto client = inflight_clients.find(request->client_id);
+      if (--client->second == 0)
+        inflight_clients.erase(client);
+      if (request->admitted_at)
+        --resident_count;
+      reserved_prefill_tokens -= request->reserved_prefill_tokens;
+      request->reserved_prefill_tokens = 0;
+      request->accounted = false;
+    }
+  }
+
+  static void CopyCheckpointMetrics(
+      const std::shared_ptr<ScheduledRequest>& request,
+      const TextRunnerPool::Request::CommitMetrics& metrics) {
+    if (metrics.prefix_checkpoint_tokens != 0) {
+      switch (metrics.prefix_checkpoint_kind) {
+        case TextCacheBoundaryKind::kSystemEnd:
+          request->result.prefix_checkpoint_kind = "system_end";
+          break;
+        case TextCacheBoundaryKind::kLastUserStart:
+          request->result.prefix_checkpoint_kind = "last_user_start";
+          break;
+        case TextCacheBoundaryKind::kHistoryEnd:
+          request->result.prefix_checkpoint_kind = "history_end";
+          break;
+        case TextCacheBoundaryKind::kFullPrompt:
+          request->result.prefix_checkpoint_kind = "full_prompt";
+          break;
+        case TextCacheBoundaryKind::kLearnedPrefix:
+          request->result.prefix_checkpoint_kind = "learned_prefix";
+          break;
+      }
+    }
+    request->result.prefix_checkpoint_tokens = metrics.prefix_checkpoint_tokens;
+    request->result.prefix_checkpoint_bytes = metrics.prefix_checkpoint_bytes;
+    request->result.prefix_checkpoint_ms = metrics.prefix_checkpoint_ms;
+    request->result.prefix_checkpoint_failures =
+        metrics.prefix_checkpoint_failures;
+  }
+
   void FinalizeResult(const std::shared_ptr<ScheduledRequest>& request,
                       TextGenerationBackend::FinishReason finish_reason) {
     request->result.completion_tokens = request->result.tokens.size();
@@ -304,13 +496,16 @@ struct TextGenerationScheduler::Impl {
       request->result.text =
           runner_pool->runner().Decode(request->result.tokens);
     }
+    FinalizeTiming(request);
   }
 
   void CompleteCancelled(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
     try {
+      BeginWork(request);
       if (request->runner_request) {
         const auto retained = request->runner_request.Cancel();
+        CopyCheckpointMetrics(request, retained);
         request->result.cache_snapshot_bytes = retained.snapshot_bytes;
         request->result.cache_snapshot_ms = retained.snapshot_ms;
         request->result.cache_disk_queued_bytes = retained.disk_queued_bytes;
@@ -320,16 +515,18 @@ struct TextGenerationScheduler::Impl {
       FinalizeResult(request, TextGenerationBackend::FinishReason::kCancelled);
       PublishTerminal(request, {}, true);
     } catch (...) {
-      PublishTerminal(request, std::current_exception(), true);
+      CompleteFailure(request, std::current_exception());
     }
   }
 
   void CompleteFailure(const std::shared_ptr<ScheduledRequest>& request,
                        std::exception_ptr failure) noexcept {
+    BeginWork(request);
     if (request->runner_request) {
       request->runner_request.Invalidate();
     }
     request->result.completion_tokens = request->result.tokens.size();
+    FinalizeTiming(request);
     PublishTerminal(request, std::move(failure), true);
   }
 
@@ -338,6 +535,19 @@ struct TextGenerationScheduler::Impl {
     CompleteFailure(request, std::make_exception_ptr(TextGenerationError(
                                  TextGenerationErrorCode::kDeadlineExceeded,
                                  "text generation request deadline exceeded")));
+  }
+
+  void CompleteAdmissionTimeout(
+      const std::shared_ptr<ScheduledRequest>& request) {
+    CompleteFailure(request, std::make_exception_ptr(TextGenerationError(
+                                 TextGenerationErrorCode::kAdmissionTimeout,
+                                 "text generation admission wait exceeded")));
+  }
+
+  [[nodiscard]] bool QueueExpired(
+      const std::shared_ptr<ScheduledRequest>& request) const {
+    return !request->admitted_at && request->queue_deadline &&
+           clock() >= *request->queue_deadline;
   }
 
   [[nodiscard]] bool CompleteIfStopped(
@@ -351,6 +561,10 @@ struct TextGenerationScheduler::Impl {
         CompleteCancelled(request);
         return true;
       }
+      if (QueueExpired(request)) {
+        CompleteAdmissionTimeout(request);
+        return true;
+      }
       return false;
     } catch (...) {
       CompleteFailure(request, std::current_exception());
@@ -361,6 +575,7 @@ struct TextGenerationScheduler::Impl {
   void CompleteSuccess(const std::shared_ptr<ScheduledRequest>& request,
                        TextGenerationBackend::FinishReason finish_reason) {
     const auto cache_commit = request->runner_request.Commit();
+    CopyCheckpointMetrics(request, cache_commit);
     request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
     request->result.cache_disk_queued_bytes = cache_commit.disk_queued_bytes;
@@ -380,13 +595,17 @@ struct TextGenerationScheduler::Impl {
         const bool deadline_exceeded = DeadlineExceeded(request);
         const bool cancelled =
             !deadline_exceeded && CancellationRequested(request);
-        if (!(deadline_exceeded || cancelled) || !RemoveQueued(request)) {
+        const bool queue_expired = QueueExpired(request);
+        if (!(deadline_exceeded || cancelled || queue_expired) ||
+            !RemoveQueued(request)) {
           continue;
         }
         if (deadline_exceeded) {
           CompleteDeadline(request);
-        } else {
+        } else if (cancelled) {
           CompleteCancelled(request);
+        } else {
+          CompleteAdmissionTimeout(request);
         }
       } catch (...) {
         if (RemoveQueued(request)) {
@@ -412,6 +631,11 @@ struct TextGenerationScheduler::Impl {
           continue;
         }
 
+        request->admitted_at = clock();
+        {
+          const std::lock_guard<std::mutex> lock(queue_mutex);
+          ++resident_count;
+        }
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
@@ -422,7 +646,8 @@ struct TextGenerationScheduler::Impl {
                      DeadlineExceeded(request);
             },
             std::move(request->prompt_context), request->cache_prompt,
-            request->cache_prefix_tokens);
+            request->cache_prefix_tokens, request->json_constraint,
+            std::move(request->cache_boundaries));
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
@@ -444,9 +669,13 @@ struct TextGenerationScheduler::Impl {
             request->runner_request.cache_disk_hit();
         request->result.incremental_prefill_supported =
             incremental_prefill_supported;
-        request->result.queue_ms = std::chrono::duration<double, std::milli>(
-                                       Clock::now() - request->request_start)
-                                       .count();
+        request->result.queue_ms = request->result.queue_admission_ms =
+            Milliseconds(*request->admitted_at - request->request_start);
+        request->result.effective_prefill_tokens =
+            request->result.prompt_tokens -
+            request->result.cached_prompt_tokens;
+        ReservePrefill(request, request->result.effective_prefill_tokens);
+        EndWork(request);
         request->result.resident_requests_at_admission =
             prefilling.size() + decoding.size() + capturing + 1;
         request->phase.store(TextRequestPhase::kAdmitted,
@@ -456,7 +685,14 @@ struct TextGenerationScheduler::Impl {
                                  : TextRequestPhase::kPrefilling,
                              std::memory_order_release);
         if (request->runner_request.prefill_complete()) {
-          request->decode_due = true;
+          // Replacements cannot renew a spent burst. Existing due decoders
+          // still finish their round before the next prefill chunk.
+          const bool spent =
+              scheduler_policy.decode_burst.count() > 0 &&
+              (decode_burst_ms >= scheduler_policy.decode_burst.count() ||
+               decode_burst_steps >=
+                   scheduler_policy.max_decode_steps_per_burst);
+          request->decode_due = !spent;
           decoding.push_back(std::move(request));
         } else {
           prefilling.push_back(std::move(request));
@@ -469,6 +705,7 @@ struct TextGenerationScheduler::Impl {
 
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
                    bool decoder_runnable, bool snapshot_pending = false) {
+    BeginWork(request);
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -481,19 +718,46 @@ struct TextGenerationScheduler::Impl {
       // that capture promptly. Spare slots alone do not change lone prefill.
       const bool bounded_prefill = incremental_prefill_supported &&
                                    (decoder_runnable || snapshot_pending);
-      const std::size_t budget = bounded_prefill
-                                     ? prefill_policy.decode_active_tokens
-                                     : request->runner_request.prompt_tokens();
+      std::size_t budget = bounded_prefill
+                               ? prefill_policy.decode_active_tokens
+                               : request->runner_request.prompt_tokens();
+      if (bounded_prefill && prefill_policy.adaptive_chunking) {
+        const auto cap = std::min(budget, kDefaultDecodeActivePrefillTokens);
+        budget = cap;
+        if (measured_prefill_ms_per_token > 0) {
+          const double estimated = prefill_policy.target_chunk_time.count() /
+                                   measured_prefill_ms_per_token;
+          budget = static_cast<std::size_t>(std::clamp(
+              estimated, static_cast<double>(prefill_policy.min_chunk_tokens),
+              static_cast<double>(cap)));
+        }
+      }
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
           !incremental_prefill_supported) {
         request->result.prefill_fallback_reason =
             "incremental_prefill_unavailable";
       }
-      const auto start = Clock::now();
-      const auto step = request->runner_request.Prefill(budget);
-      request->result.prefill_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() - start)
-              .count();
+      const auto start = clock();
+      TextPrefillStep step;
+      try {
+        step = request->runner_request.Prefill(budget);
+      } catch (...) {
+        request->result.prefill_ms += Milliseconds(clock() - start);
+        throw;
+      }
+      const double elapsed = Milliseconds(clock() - start);
+      request->result.prefill_ms += elapsed;
+      request->result.max_prefill_chunk_ms =
+          std::max(request->result.max_prefill_chunk_ms, elapsed);
+      if (step.consumed_tokens > 0 && elapsed > 0) {
+        const double sample = elapsed / step.consumed_tokens;
+        // React immediately to slower work, recover conservatively when faster.
+        measured_prefill_ms_per_token = std::max(
+            sample, 0.8 * measured_prefill_ms_per_token + 0.2 * sample);
+      }
+      ReservePrefill(request, request->reserved_prefill_tokens -
+                                  std::min(request->reserved_prefill_tokens,
+                                           step.consumed_tokens));
       request->result.prefill_tokens += step.consumed_tokens;
       ++request->result.prefill_chunks;
       request->result.max_prefill_chunk_tokens = std::max(
@@ -513,6 +777,8 @@ struct TextGenerationScheduler::Impl {
         return;
       }
 
+      if (step.decode_ready && !request->decode_ready_at)
+        request->decode_ready_at = clock();
       request->phase.store(step.decode_ready ? TextRequestPhase::kDecodeReady
                                              : TextRequestPhase::kPrefilling,
                            std::memory_order_release);
@@ -521,6 +787,31 @@ struct TextGenerationScheduler::Impl {
       if (!CompleteIfStopped(request)) {
         CompleteFailure(request, failure);
       }
+    }
+  }
+
+  template<class Work>
+  auto MeasureDecode(const std::shared_ptr<ScheduledRequest>& request,
+                     Work work) {
+    const auto start = clock();
+    try {
+      if constexpr (std::is_void_v<std::invoke_result_t<Work>>) {
+        work();
+        const double elapsed = Milliseconds(clock() - start);
+        request->result.decode_ms += elapsed;
+        decode_service_ms += elapsed;
+      } else {
+        auto result = work();
+        const double elapsed = Milliseconds(clock() - start);
+        request->result.decode_ms += elapsed;
+        decode_service_ms += elapsed;
+        return result;
+      }
+    } catch (...) {
+      const double elapsed = Milliseconds(clock() - start);
+      request->result.decode_ms += elapsed;
+      decode_service_ms += elapsed;
+      throw;
     }
   }
 
@@ -540,16 +831,13 @@ struct TextGenerationScheduler::Impl {
         return std::nullopt;
       }
       // Snapshot capture and work for other requests are outside this step.
-      return Clock::now();
+      return clock();
     }
     request->phase.store(TextRequestPhase::kDecoding,
                          std::memory_order_release);
-    const auto decode_start = Clock::now();
-    const auto selection = request->runner_request.SelectNext();
+    const auto selection = MeasureDecode(
+        request, [&] { return request->runner_request.SelectNext(); });
     if (selection.stop) {
-      request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
-              .count();
       CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
       return std::nullopt;
     }
@@ -557,9 +845,6 @@ struct TextGenerationScheduler::Impl {
     if (!PublishSelection(request, selection)) {
       return std::nullopt;
     }
-    request->result.decode_ms +=
-        std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
-            .count();
     request->advance_pending = true;
     return PrepareDecode(request);
   }
@@ -567,8 +852,17 @@ struct TextGenerationScheduler::Impl {
   [[nodiscard]] bool PublishSelection(
       const std::shared_ptr<ScheduledRequest>& request,
       const TextDecodeSelection& selection) {
-    const auto now = Clock::now();
+    if (selection.piece.size() >
+        request->max_output_bytes - request->generated_output_bytes) {
+      CompleteFailure(request,
+                      std::make_exception_ptr(TextGenerationError(
+                          TextGenerationErrorCode::kOutputLimit,
+                          "text generation output byte limit exceeded")));
+      return false;
+    }
+    const auto now = clock();
     if (!request->previous_token.has_value()) {
+      request->result.first_token_emitted = true;
       request->result.ttft_ms = std::chrono::duration<double, std::milli>(
                                     now - request->request_start)
                                     .count();
@@ -581,14 +875,6 @@ struct TextGenerationScheduler::Impl {
       ++request->inter_token_samples;
     }
     request->previous_token = now;
-    if (selection.piece.size() >
-        request->max_output_bytes - request->generated_output_bytes) {
-      CompleteFailure(request,
-                      std::make_exception_ptr(TextGenerationError(
-                          TextGenerationErrorCode::kOutputLimit,
-                          "text generation output byte limit exceeded")));
-      return false;
-    }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
     if (!PublishPiece(request, selection.piece)) {
@@ -607,11 +893,7 @@ struct TextGenerationScheduler::Impl {
     return true;
   }
 
-  void FinishAdvanced(const std::shared_ptr<ScheduledRequest>& request,
-                      Clock::time_point decode_start) {
-    request->result.decode_ms +=
-        std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
-            .count();
+  void FinishAdvanced(const std::shared_ptr<ScheduledRequest>& request) {
     if (CompleteIfStopped(request)) {
       return;
     }
@@ -631,8 +913,8 @@ struct TextGenerationScheduler::Impl {
       if (!decode_start.has_value()) {
         return;
       }
-      request->runner_request.Advance();
-      FinishAdvanced(request, *decode_start);
+      MeasureDecode(request, [&] { request->runner_request.Advance(); });
+      FinishAdvanced(request);
     } catch (...) {
       const auto failure = std::current_exception();
       if (!CompleteIfStopped(request)) {
@@ -652,11 +934,12 @@ struct TextGenerationScheduler::Impl {
                            std::memory_order_release);
       if (!PrepareFirstSnapshot(request))
         return;
-      const auto decode_start = Clock::now();
       const std::size_t remaining =
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
-      const auto step = request->runner_request.DecodeStep(remaining);
+      const auto step = MeasureDecode(request, [&] {
+        return request->runner_request.DecodeStep(remaining);
+      });
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
 
@@ -667,9 +950,6 @@ struct TextGenerationScheduler::Impl {
         }
       }
 
-      request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
-              .count();
       if (step.stop) {
         CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
         return;
@@ -687,17 +967,14 @@ struct TextGenerationScheduler::Impl {
 
   bool PrepareFirstSnapshot(const std::shared_ptr<ScheduledRequest>& request) {
     if (request->result.tokens.empty() && !request->preview_stops) {
-      const auto preview_start = Clock::now();
-      const auto preview = request->runner_request.PreviewFirstToken();
+      const auto preview = MeasureDecode(
+          request, [&] { return request->runner_request.PreviewFirstToken(); });
       if (preview && !preview->stop) {
         if (!PublishSelection(request, *preview))
           return false;
         request->preview_token = preview->token;
       }
       request->preview_stops = preview && preview->stop;
-      request->result.decode_ms += std::chrono::duration<double, std::milli>(
-                                       Clock::now() - preview_start)
-                                       .count();
     }
     if (!request->runner_request.PreparePromptSnapshot())
       return false;
@@ -745,7 +1022,6 @@ struct TextGenerationScheduler::Impl {
     consecutive_active_prefill_chunks = 0;
     struct PreparedRequest {
       std::shared_ptr<ScheduledRequest> request;
-      Clock::time_point decode_start;
     };
     std::vector<PreparedRequest> prepared;
     prepared.reserve(requests.size());
@@ -755,7 +1031,6 @@ struct TextGenerationScheduler::Impl {
         if (decode_start.has_value()) {
           prepared.push_back({
               .request = request,
-              .decode_start = *decode_start,
           });
         }
       } catch (...) {
@@ -767,8 +1042,10 @@ struct TextGenerationScheduler::Impl {
     }
     if (prepared.size() == 1) {
       try {
-        prepared.front().request->runner_request.Advance();
-        FinishAdvanced(prepared.front().request, prepared.front().decode_start);
+        MeasureDecode(prepared.front().request, [&] {
+          prepared.front().request->runner_request.Advance();
+        });
+        FinishAdvanced(prepared.front().request);
       } catch (...) {
         CompleteFailure(prepared.front().request, std::current_exception());
       }
@@ -779,8 +1056,9 @@ struct TextGenerationScheduler::Impl {
     if (plan.kind != TextExecutionPlanKind::kBatched) {
       for (const auto& item : prepared) {
         try {
-          item.request->runner_request.Advance();
-          FinishAdvanced(item.request, item.decode_start);
+          MeasureDecode(item.request,
+                        [&] { item.request->runner_request.Advance(); });
+          FinishAdvanced(item.request);
         } catch (...) {
           CompleteFailure(item.request, std::current_exception());
         }
@@ -794,17 +1072,26 @@ struct TextGenerationScheduler::Impl {
       runner_requests.push_back(&item.request->runner_request);
     }
     std::vector<std::exception_ptr> failures;
+    const auto batch_start = clock();
     try {
       failures = runner_pool->AdvanceBatch(runner_requests, plan);
     } catch (...) {
       const auto failure = std::current_exception();
+      const double elapsed = Milliseconds(clock() - batch_start);
+      decode_service_ms += elapsed;
       for (const auto& item : prepared) {
+        item.request->result.decode_ms += elapsed;
         if (!CompleteIfStopped(item.request))
           CompleteFailure(item.request, failure);
       }
       return;
     }
 
+    const auto batch_end = clock();
+    const double batch_ms = Milliseconds(batch_end - batch_start);
+    decode_service_ms += batch_ms;
+    for (const auto& item : prepared)
+      item.request->result.decode_ms += batch_ms;
     const std::string execution_plan =
         "batched-w" + std::to_string(plan.physical_width);
     for (std::size_t i = 0; i < prepared.size(); ++i) {
@@ -817,7 +1104,7 @@ struct TextGenerationScheduler::Impl {
       item.request->result.physical_execution_width = std::max(
           item.request->result.physical_execution_width, plan.physical_width);
       item.request->result.execution_plan = execution_plan;
-      FinishAdvanced(item.request, item.decode_start);
+      FinishAdvanced(item.request);
     }
   }
 
@@ -831,7 +1118,6 @@ struct TextGenerationScheduler::Impl {
     consecutive_active_prefill_chunks = 0;
     struct PreparedRequest {
       std::shared_ptr<ScheduledRequest> request;
-      Clock::time_point decode_start;
       std::size_t remaining;
     };
     std::vector<PreparedRequest> prepared;
@@ -851,7 +1137,6 @@ struct TextGenerationScheduler::Impl {
       }
       prepared.push_back({
           .request = request,
-          .decode_start = Clock::now(),
           .remaining = request->token_limit - request->result.tokens.size() +
                        (request->preview_token.has_value() ? 1 : 0),
       });
@@ -882,17 +1167,26 @@ struct TextGenerationScheduler::Impl {
     }
 
     std::vector<TextDecodeStep> steps;
+    const auto batch_start = clock();
     try {
       steps = runner_pool->DecodeBatch(runner_requests, max_tokens, plan);
     } catch (...) {
       const auto failure = std::current_exception();
+      const double elapsed = Milliseconds(clock() - batch_start);
+      decode_service_ms += elapsed;
       for (const auto& item : prepared) {
+        item.request->result.decode_ms += elapsed;
         if (!CompleteIfStopped(item.request))
           CompleteFailure(item.request, failure);
       }
       return;
     }
 
+    const auto batch_end = clock();
+    const double batch_ms = Milliseconds(batch_end - batch_start);
+    decode_service_ms += batch_ms;
+    for (const auto& item : prepared)
+      item.request->result.decode_ms += batch_ms;
     for (std::size_t index = 0; index < prepared.size(); ++index) {
       const auto& item = prepared[index];
       const auto& step = steps[index];
@@ -928,10 +1222,6 @@ struct TextGenerationScheduler::Impl {
           break;
         }
       }
-      item.request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() -
-                                                    item.decode_start)
-              .count();
       if (!published || IsTerminal(item.request)) {
         continue;
       }
@@ -1016,6 +1306,12 @@ struct TextGenerationScheduler::Impl {
         if (request->runner_request.SnapshotPending()) {
           capturing.push_back(std::move(request));
         } else if (!CompleteIfStopped(request)) {
+          AccountWait(request);
+          request->waiting_for_snapshot = false;
+          request->wait_start = clock();
+          if (request->runner_request.prefill_complete() &&
+              !request->decode_ready_at)
+            request->decode_ready_at = clock();
           if (request->runner_request.prefill_complete())
             decoding.push_back(std::move(request));
           else
@@ -1024,6 +1320,8 @@ struct TextGenerationScheduler::Impl {
       }
       Admit(prefilling, decoding, capturing.size(), stop_token);
       if (prefilling.empty() && decoding.empty()) {
+        decode_burst_ms = 0;
+        decode_burst_steps = 0;
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
@@ -1061,11 +1359,21 @@ struct TextGenerationScheduler::Impl {
                       [](const auto& request) {
                         return request->result.tokens.empty();
                       });
+      const bool burst_complete =
+          decode_burst_ms >= scheduler_policy.decode_burst.count() ||
+          decode_burst_steps >= scheduler_policy.max_decode_steps_per_burst;
       if (!prefilling.empty() && !decoding.empty() &&
-          (!due_decoder || assemble_initial_batch)) {
+          ((!due_decoder && burst_complete) || assemble_initial_batch)) {
         auto request = std::move(prefilling.front());
         prefilling.pop_front();
+        const auto started = clock();
         StepPrefill(request, true);
+        const double elapsed = Milliseconds(clock() - started);
+        for (const auto& peer : decoding)
+          peer->result.peer_prefill_ms += elapsed;
+        EndWork(request);
+        decode_burst_ms = 0;
+        decode_burst_steps = 0;
         if (!IsTerminal(request)) {
           if (request->runner_request.SnapshotPending()) {
             capturing.push_back(std::move(request));
@@ -1098,8 +1406,14 @@ struct TextGenerationScheduler::Impl {
           request->decode_due = false;
           batch.push_back(std::move(request));
         }
+        for (const auto& request : batch)
+          BeginWork(request);
+        const double service_before = decode_service_ms;
         StepDecodeBatch(batch);
+        decode_burst_ms += decode_service_ms - service_before;
+        ++decode_burst_steps;
         for (auto& request : batch) {
+          EndWork(request);
           if (!IsTerminal(request)) {
             if (request->runner_request.SnapshotPending())
               capturing.push_back(std::move(request));
@@ -1113,6 +1427,9 @@ struct TextGenerationScheduler::Impl {
       auto request = std::move(prefilling.front());
       prefilling.pop_front();
       StepPrefill(request, false, !capturing.empty());
+      EndWork(request);
+      decode_burst_ms = 0;
+      decode_burst_steps = 0;
       if (!IsTerminal(request)) {
         if (request->runner_request.SnapshotPending()) {
           capturing.push_back(std::move(request));
@@ -1132,6 +1449,7 @@ struct TextGenerationScheduler::Impl {
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
+  ClockSource clock;
   std::shared_ptr<OutputBudget> output_budget;
   bool incremental_prefill_supported{false};
   bool final_token_advance_required{true};
@@ -1143,6 +1461,15 @@ struct TextGenerationScheduler::Impl {
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
+  std::size_t inflight_count{0};
+  std::size_t resident_count{0};
+  std::size_t sticky_admission_run{0};
+  std::size_t reserved_prefill_tokens{0};
+  std::unordered_map<std::string, std::size_t> inflight_clients;
+  double measured_prefill_ms_per_token{0};
+  double decode_service_ms{0};
+  double decode_burst_ms{0};
+  std::size_t decode_burst_steps{0};
   bool stopping{false};
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
@@ -1261,9 +1588,10 @@ void TextGenerationScheduler::Request::Cancel() noexcept {
 
 TextGenerationScheduler::TextGenerationScheduler(
     std::shared_ptr<TextRunnerPool> runner_pool,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy)
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    ClockSource clock)
     : impl_(std::make_unique<Impl>(std::move(runner_pool), prefill_policy,
-                                   scheduler_policy)) {}
+                                   scheduler_policy, std::move(clock))) {}
 
 TextGenerationScheduler::~TextGenerationScheduler() = default;
 
@@ -1302,11 +1630,25 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     throw std::invalid_argument("text scheduler prompt must not be empty");
   }
   sampling.Validate();
+  if (metadata.json_constraint && sampling.temperature != 0)
+    throw std::invalid_argument(
+        "JSON constrained decoding requires temperature 0");
+  if (metadata.json_constraint &&
+      !impl_->runner_pool->runner().Descriptor().capabilities.json_constraints)
+    throw std::invalid_argument(
+        "model does not support JSON constrained decoding");
 
+  if (metadata.estimated_prefill_tokens &&
+      *metadata.estimated_prefill_tokens > prompt.size())
+    throw std::invalid_argument("prefill estimate exceeds prompt size");
+  if (!metadata.cache_prompt)
+    metadata.estimated_prefill_tokens = prompt.size();
   auto request = std::make_shared<ScheduledRequest>();
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
+  request->result.request_id = request->id;
+  request->result.estimated_prefill_tokens = metadata.estimated_prefill_tokens;
   request->result.prompt_tokens = prompt.size();
   request->result.client_id = request->client_id;
   request->result.configured_active_prefill_tokens =
@@ -1317,13 +1659,20 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       impl_->runner_pool->capacity() == 1 ? "serial-c1" : "serial-fallback";
   request->prompt = std::move(prompt);
   request->prompt_context = std::move(metadata.prompt_context);
+  request->json_constraint = std::move(metadata.json_constraint);
+  request->cache_boundaries = std::move(metadata.cache_boundaries);
   request->cache_prompt = metadata.cache_prompt;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
   request->token_limit = max_tokens > 0 ? max_tokens : 1;
   request->sampling = sampling;
   request->external_cancellation = is_cancelled;
   request->publish_token_pieces = publish_token_pieces;
+  request->clock = impl_->clock;
+  request->submitted_at = impl_->clock();
   request->request_start = metadata.request_start;
+  if (impl_->scheduler_policy.queue_timeout.count() > 0)
+    request->queue_deadline =
+        request->submitted_at + impl_->scheduler_policy.queue_timeout;
   request->deadline = metadata.deadline;
   if (!request->deadline.has_value() &&
       impl_->scheduler_policy.request_timeout.count() > 0) {
@@ -1346,6 +1695,27 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       throw TextGenerationError(TextGenerationErrorCode::kQueueFull,
                                 "text generation pending queue is full");
     }
+    const auto inflight_client =
+        impl_->inflight_clients.find(request->client_id);
+    const std::size_t client_inflight =
+        inflight_client == impl_->inflight_clients.end()
+            ? 0
+            : inflight_client->second;
+    const auto client_limit =
+        impl_->scheduler_policy.max_inflight_requests_per_client;
+    if (client_limit > 0 && client_inflight >= client_limit)
+      throw TextGenerationError(
+          TextGenerationErrorCode::kClientInflightFull,
+          "text generation client inflight limit exceeded");
+    const auto estimate = request->result.estimated_prefill_tokens;
+    const auto token_limit =
+        impl_->scheduler_policy.max_inflight_prefill_tokens;
+    if (token_limit > 0 && estimate &&
+        (*estimate > token_limit ||
+         impl_->reserved_prefill_tokens > token_limit - *estimate))
+      throw TextGenerationError(
+          TextGenerationErrorCode::kPrefillBudgetFull,
+          "text generation known prefill budget exceeded");
     auto client =
         std::find_if(impl_->queued_clients.begin(), impl_->queued_clients.end(),
                      [&](const PendingClient& pending) {
@@ -1368,6 +1738,13 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     request->result.client_queue_depth_at_submit = client->requests.size() + 1;
     client->requests.push_back(request);
     ++impl_->queued_count;
+    request->accounted = true;
+    request->reserved_prefill_tokens = estimate.value_or(0);
+    impl_->reserved_prefill_tokens += request->reserved_prefill_tokens;
+    request->result.resident_requests_at_submit = impl_->resident_count;
+    request->result.inflight_requests_at_submit = ++impl_->inflight_count;
+    request->result.client_inflight_requests_at_submit =
+        ++impl_->inflight_clients[request->client_id];
   }
   impl_->queue_condition.notify_one();
   return Request(std::make_unique<Request::Impl>(std::move(request)));

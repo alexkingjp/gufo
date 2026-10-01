@@ -46,6 +46,10 @@ struct TextSpeculativeConfig {
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
+  /// Flash-Next only: substitute prompt-lookup followers into greedy MTP
+  /// draft chains (halogen production runs ngram 3 / chain 3 on greedy
+  /// requests). Width selection stays with the MTP controller.
+  bool prompt_lookup{false};
 };
 
 struct TextDiskCacheConfig {
@@ -54,6 +58,21 @@ struct TextDiskCacheConfig {
                              1024U};
   std::size_t staging_capacity_bytes{static_cast<std::size_t>(512) * 1024U *
                                      1024U};
+  /// Retained host snapshot byte budget. 0 derives it from free memory at
+  /// load time; a nonzero value overrides the derivation (serving hosts with
+  /// many sessions need more than the derived default — see the 2026-09-26
+  /// A/B: four ~4 GiB conversation histories cannot fit in derived/2).
+  std::size_t host_snapshot_capacity_bytes{0};
+  /// Elastic session history budget (0 = legacy full-context
+  /// preallocation). Sessions size their device K/V and pooled-key caches
+  /// to their content and grow on demand inside this shared device budget;
+  /// the freed headroom lets more conversation lineages park warm on the
+  /// host. Requires a Flash-Next model.
+  std::size_t history_budget_bytes{0};
+  /// Quantize Flash-Next session K/V caches to packed q8_0 blocks.
+  bool kv_quant{false};
+  /// Elastic-history diagnostics sink (growth, budget refusals).
+  std::function<void(std::string_view)> history_event_log;
   std::string model_artifact_fingerprint;
   std::string draft_model_artifact_fingerprint;
 };
@@ -116,6 +135,7 @@ public:
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
+  [[nodiscard]] bool supports_json_constraints() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(

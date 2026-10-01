@@ -144,6 +144,12 @@ public:
   /// Drains accepted writes. Shutdown also drains automatically.
   void Flush();
 
+  /// Metadata-only exact compatible prefix lookup; never reads a payload.
+  /// Zero also means the metadata gate is busy. Restore revalidates the file.
+  [[nodiscard]] std::size_t LongestPrefixTokens(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity = {}) const;
+
   /// Restores the longest exact saved prefix of prompt into state.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,

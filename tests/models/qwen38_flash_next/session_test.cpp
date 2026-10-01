@@ -30,6 +30,133 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
+std::vector<std::uint8_t> SnapshotBytes(const qfn::SessionSnapshot& snapshot) {
+  std::vector<std::uint8_t> bytes(snapshot.SizeBytes());
+  Require(snapshot.CopyTo(bytes), "snapshot serialization failed");
+  return bytes;
+}
+
+void CheckGreedySnapshots(const std::shared_ptr<qfn::Model>& model,
+                          qfn::Session& scalar,
+                          const qfn::SessionSnapshot& left,
+                          const qfn::SessionSnapshot& right,
+                          const sampling::SamplerState& initial_sampler) {
+  // Mirror only the versioned serialization headers, not device state. Fail
+  // closed on a changed ABI before classifying predictor-private sections.
+  struct HostHeader {
+    std::array<char, 8> magic;
+    std::uint32_t version, vocab, tokens, hidden;
+    std::uint64_t executor_bytes;
+    qfn::MtpLengthState policy;
+    std::uint32_t image_bytes, concurrency, reserved;
+  };
+  struct DeviceHeader {
+    std::array<char, 8> magic;
+    std::uint32_t layers, interval, conv, state, kv, index, ratio, hc, ple;
+    std::uint32_t mtp, position, blocks, mtp_position, mtp_blocks, hidden,
+        images;
+    std::array<std::int32_t, 2> ngram;
+    std::uint64_t bytes;
+  };
+  static_assert(sizeof(HostHeader) == 120 && sizeof(DeviceHeader) == 88);
+  const auto left_bytes = SnapshotBytes(left),
+             right_bytes = SnapshotBytes(right);
+  const auto a = std::span(left_bytes), b = std::span(right_bytes);
+  Require(a.size() == b.size() && a.size() >= sizeof(HostHeader) &&
+              qfn::Session::kSnapshotPayloadVersion == 14,
+          "greedy snapshot comparison requires matching text ABI v14");
+  HostHeader h{};
+  std::memcpy(&h, a.data(), sizeof(h));
+  Require(
+      h.magic == std::array<char, 8>{'Q', 'F', 'N', 'S', 'E', 'S', 'S', '1'} &&
+          h.version == 14 && h.image_bytes == 0 && h.reserved == 0,
+      "greedy snapshot host header is not the expected text format");
+  const std::size_t host =
+      sizeof(h) + std::size_t{h.tokens} * 4 + std::size_t{h.vocab} * 4;
+  Require(host <= a.size() && a.size() - host == h.executor_bytes &&
+              h.executor_bytes >= sizeof(DeviceHeader),
+          "greedy snapshot executor header is truncated");
+  DeviceHeader d{};
+  std::memcpy(&d, a.data() + host, sizeof(d));
+  const auto& c = model->config();
+  Require(
+      d.magic == std::array<char, 8>{'Q', 'F', 'N', 'S', 'N', 'A', 'P', '4'} &&
+          d.layers == c.num_layers && d.interval == c.full_attention_interval &&
+          d.interval != 0 && d.ratio == c.compress_ratio && d.ratio != 0 &&
+          d.kv == c.AttentionKvDim() && d.index == c.indexer_head_dim &&
+          d.hc == c.HcDim() && d.position == h.tokens && d.hidden == h.hidden &&
+          d.images == 0 && d.mtp == 1 && d.bytes == h.executor_bytes &&
+          d.blocks <= d.position / d.ratio &&
+          d.mtp_blocks <= d.mtp_position / d.ratio,
+      "greedy snapshot executor geometry differs");
+  const std::size_t recurrent = (d.layers - d.layers / d.interval) *
+                                (std::size_t{d.conv} + d.state) * sizeof(float);
+  const std::size_t attention =
+      (d.layers / d.interval) *
+      (2 * std::size_t{d.position} * d.kv * sizeof(std::uint16_t) +
+       std::size_t{d.position - d.blocks * d.ratio} * d.index * sizeof(float) +
+       std::size_t{d.blocks} * d.index * sizeof(std::uint16_t));
+  const auto target_end = host + sizeof(d) + recurrent +
+                          std::size_t{d.ple} * sizeof(float) + attention;
+  const std::size_t draft_bytes =
+      std::size_t{d.mtp_position - d.mtp_blocks * d.ratio} * d.index *
+          sizeof(float) +
+      std::size_t{d.mtp_blocks} * d.index * sizeof(std::uint16_t) +
+      2 * std::size_t{d.mtp_position} * d.kv * sizeof(std::uint16_t) +
+      std::size_t{d.hc} * sizeof(float);
+  const auto kept_bytes = std::size_t{h.hidden} * d.hc * sizeof(float);
+  Require(target_end + draft_bytes + kept_bytes == a.size(),
+          "greedy snapshot sections do not cover the payload");
+  Require(std::ranges::equal(a.first(target_end), b.first(target_end)),
+          "greedy snapshot target state or metadata differs");
+  Require(std::ranges::equal(a.last(kept_bytes), b.last(kept_bytes)),
+          "greedy snapshot retained target hidden rows differ");
+
+  std::string error;
+  for (const auto* snapshot : {&left, &right}) {
+    auto restored = model->CreateSession(gufo::core::SessionMode::kSpeculative,
+                                         scalar.ContextSize(), &error);
+    Require(restored && restored->RestoreSnapshot(*snapshot, &error), error);
+    const auto roundtrip = restored->SaveSnapshot(&error);
+    Require(roundtrip && SnapshotBytes(*roundtrip) == SnapshotBytes(*snapshot),
+            "greedy snapshot failed its own byte-exact round trip");
+    auto sampler = initial_sampler;
+    auto reference_sampler = initial_sampler;
+    Require(scalar.RestoreSnapshot(left, &error), error);
+    std::size_t generated = 0, cycle = 0;
+    while (generated < 16) {
+      const auto budget = std::min<std::size_t>(
+          16 - generated, std::array<std::size_t, 4>{8, 2, 4, 1}[cycle++ % 4]);
+      qfn::Session::DecodeResult actual;
+      Require(restored->DecodeStep(budget, sampler, &actual, &error, false),
+              error);
+      Require(!actual.tokens.empty() && actual.tokens.size() <= budget,
+              "restored greedy snapshot violated decode budget");
+      for (auto token : actual.tokens) {
+        qfn::Session::DecodeResult expected;
+        Require(
+            scalar.DecodeStep(1, reference_sampler, &expected, &error, false),
+            error);
+        Require(expected.tokens == std::vector<std::int32_t>{token},
+                "greedy snapshot continuation changed a target token");
+      }
+      generated += actual.tokens.size();
+      RequireExact(scalar.Logits(), restored->Logits(),
+                   "greedy restored continuation changed target logits");
+      Require(scalar.Position() == restored->Position() &&
+                  std::ranges::equal(scalar.Tokens(), restored->Tokens()) &&
+                  sampler.rng_state() == reference_sampler.rng_state() &&
+                  std::ranges::equal(sampler.history(),
+                                     reference_sampler.history()),
+              "greedy restored continuation changed position, history or RNG");
+    }
+  }
+  std::cout << "greedy_snapshot target_bytes_exact=1 own_roundtrip_exact=1 "
+               "restored_target_continuation_exact=1 draft_private_equal="
+            << std::ranges::equal(a, b) << '\n'
+            << std::flush;
+}
+
 void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   const auto mode = gufo::core::SessionMode::kAutoregressive;
@@ -61,12 +188,9 @@ void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
   Require(decoding->Evaluate(prompt.back(), &error), error);
   decoding->SetCancellationCheck({});
   Require(concurrent_snapshot != nullptr, snapshot_error);
-  Require(concurrent_snapshot->bytes().size() ==
-                  expected_snapshot->bytes().size() &&
-              std::memcmp(concurrent_snapshot->bytes().data(),
-                          expected_snapshot->bytes().data(),
-                          expected_snapshot->bytes().size()) == 0,
-          "decode graph capture changed a peer snapshot");
+  Require(
+      SnapshotBytes(*concurrent_snapshot) == SnapshotBytes(*expected_snapshot),
+      "decode graph capture changed a peer snapshot");
   Require(reference->Evaluate(prompt.back(), &error), error);
   RequireExact(reference->Logits(), decoding->Logits(),
                "snapshot capture changed decode logits");
@@ -459,9 +583,11 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
         before.push_back(serial[i]->Statistics());
-        Require(serial[i]->DecodeStep(budget, serial_samplers[i], &expected[i],
-                                      &error, false),
-                error);
+        if (serial_samplers[i].config().uses_random_sampling()) {
+          Require(serial[i]->DecodeStep(budget, serial_samplers[i],
+                                        &expected[i], &error, false),
+                  error);
+        }
         requests.push_back(
             {batched[i].get(), budget, &batch_samplers[i], &actual[i], false});
       }
@@ -470,19 +596,38 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
       }
       Require(qfn::Session::DecodeBatch(requests, &error), error);
       for (std::size_t i = 0; i < width; ++i) {
+        const bool sampled = serial_samplers[i].config().uses_random_sampling();
+        const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
+        Require(!actual[i].tokens.empty() && actual[i].tokens.size() <= budget,
+                "batched decode violated its budget or made no progress");
+        if (!sampled) {
+          // Greedy widths depend on measured execution cost. Independently
+          // select every token, then compare at the batch's committed frontier.
+          for (std::size_t token = 0; token < actual[i].tokens.size();
+               ++token) {
+            qfn::Session::DecodeResult single;
+            Require(serial[i]->DecodeStep(1, serial_samplers[i], &single,
+                                          &error, false),
+                    error);
+            Require(single.tokens.size() == 1 && !single.stop,
+                    "greedy scalar reference did not advance one token");
+            expected[i].tokens.push_back(single.tokens.front());
+          }
+        }
         const auto a = serial[i]->Statistics();
         const auto b = batched[i]->Statistics();
-        Require(expected[i].tokens == actual[i].tokens &&
-                    expected[i].stop == actual[i].stop &&
-                    serial_samplers[i].rng_state() ==
-                        batch_samplers[i].rng_state() &&
-                    a.cycles == b.cycles && a.drafted == b.drafted &&
-                    a.accepted == b.accepted &&
-                    std::equal(serial[i]->Tokens().begin(),
-                               serial[i]->Tokens().end(),
-                               batched[i]->Tokens().begin(),
-                               batched[i]->Tokens().end()),
-                "batched decode tokens, RNG or acceptance differ");
+        Require(
+            expected[i].tokens == actual[i].tokens &&
+                expected[i].stop == actual[i].stop &&
+                serial_samplers[i].rng_state() ==
+                    batch_samplers[i].rng_state() &&
+                serial[i]->Position() == batched[i]->Position() &&
+                (!sampled || (a.cycles == b.cycles && a.drafted == b.drafted &&
+                              a.accepted == b.accepted)) &&
+                std::equal(
+                    serial[i]->Tokens().begin(), serial[i]->Tokens().end(),
+                    batched[i]->Tokens().begin(), batched[i]->Tokens().end()),
+            "batched decode tokens, RNG or acceptance differ");
         RequireExact(serial[i]->Logits(), batched[i]->Logits(),
                      "batched MTP frontier differs at C" +
                          std::to_string(width) + " row " + std::to_string(i) +
@@ -525,14 +670,39 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
             << " history_and_residual_exact=1\n"
             << std::flush;
   // A complete state comparison catches recurrent/hidden differences that a
-  // short output comparison could miss.
+  // short output comparison could miss. Greedy schedules can retain different
+  // draft frontiers; one common token canonicalizes the retained target rows.
+  // Historical predictor caches can remain different across greedy schedules.
   for (std::size_t i = 0; i < serial.size(); ++i) {
+    if (!serial_samplers[i].config().uses_random_sampling()) {
+      const auto serial_token = serial_samplers[i].Sample(serial[i]->Logits());
+      const auto batch_token = batch_samplers[i].Sample(batched[i]->Logits());
+      Require(serial_token == batch_token, "greedy frontier selection differs");
+      Require(serial[i]->Evaluate(static_cast<std::int32_t>(serial_token),
+                                  &error) &&
+                  batched[i]->Evaluate(static_cast<std::int32_t>(batch_token),
+                                       &error),
+              error);
+      serial_samplers[i].Accept(serial_token);
+      batch_samplers[i].Accept(batch_token);
+      serial[i]->ResetDraftPolicy();
+      batched[i]->ResetDraftPolicy();
+      RequireExact(serial[i]->Logits(), batched[i]->Logits(),
+                   "greedy canonicalized frontier differs");
+      Require(
+          serial[i]->Position() == batched[i]->Position() &&
+              serial_samplers[i].rng_state() == batch_samplers[i].rng_state(),
+          "greedy canonicalized position or RNG differs");
+    }
     const auto a = serial[i]->SaveSnapshot(&error);
     const auto b = batched[i]->SaveSnapshot(&error);
-    Require(a && b &&
-                std::equal(a->bytes().begin(), a->bytes().end(),
-                           b->bytes().begin(), b->bytes().end()),
-            "batched snapshot state differs: " + std::to_string(i));
+    Require(a && b, error);
+    if (serial_samplers[i].config().uses_random_sampling()) {
+      Require(SnapshotBytes(*a) == SnapshotBytes(*b),
+              "sampled batched snapshot state differs: " + std::to_string(i));
+    } else {
+      CheckGreedySnapshots(model, *serial[i], *a, *b, serial_samplers[i]);
+    }
   }
   std::cout << "batch independent_state_exact=1\n" << std::flush;
 }
@@ -621,8 +791,9 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
     }
     const auto direct_stats = direct->Statistics();
     Require(direct_tokens == speculative.tokens &&
-                direct_stats.drafted == speculative.draft_tokens &&
-                direct_stats.accepted == speculative.draft_accepted_tokens,
+                (!test.config.uses_random_sampling() ||
+                 (direct_stats.drafted == speculative.draft_tokens &&
+                  direct_stats.accepted == speculative.draft_accepted_tokens)),
             "serving lost sampling state: " + std::string(test.name));
     Require(!ordinary.tokens.empty() && ordinary.draft_tokens == 0 &&
                 speculative.draft_tokens > 0,
@@ -638,11 +809,12 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
       auto& backend = use_mtp ? mtp : ar;
       const auto& expected = use_mtp ? speculative : ordinary;
       const auto replay = backend.complete(prompt, 8, test.config);
-      Require(
-          replay.tokens == expected.tokens &&
-              replay.draft_tokens == expected.draft_tokens &&
-              replay.draft_accepted_tokens == expected.draft_accepted_tokens,
-          "serving replay changed sampling or draft acceptance");
+      Require(replay.tokens == expected.tokens &&
+                  (!test.config.uses_random_sampling() ||
+                   (replay.draft_tokens == expected.draft_tokens &&
+                    replay.draft_accepted_tokens ==
+                        expected.draft_accepted_tokens)),
+              "serving replay changed sampling or draft acceptance");
     }
     references.push_back(
         {test, prompt, std::move(ordinary), std::move(speculative)});
@@ -897,10 +1069,20 @@ int main(int argc, char** argv) {
                         decoded.tokens.end());
         }
         const auto after = mtp->Statistics();
-        Require(replay == candidate && isolated_widths == interleaved_widths &&
-                    after.drafted - stats.drafted == stats.drafted &&
-                    after.accepted - stats.accepted == stats.accepted,
-                "interleaving changed MTP proposals or acceptance");
+        Require(replay == candidate &&
+                    replay_sampler.rng_state() == b.rng_state() &&
+                    mtp->Position() == ar->Position() &&
+                    std::ranges::equal(mtp->Tokens(), ar->Tokens()) &&
+                    std::ranges::equal(replay_sampler.history(), b.history()) &&
+                    (!sampled ||
+                     (isolated_widths == interleaved_widths &&
+                      after.cycles - stats.cycles == stats.cycles &&
+                      after.drafted - stats.drafted == stats.drafted &&
+                      after.accepted - stats.accepted == stats.accepted)),
+                "interleaving changed MTP tokens, RNG, state or sampled "
+                "proposals/acceptance");
+        RequireExact(ar->Logits(), mtp->Logits(),
+                     "isolated replay changed final frontier logits");
         std::cout << "depth=" << depth << " config=" << c
                   << " tokens=" << token_count
                   << " exact=1 drafted=" << stats.drafted

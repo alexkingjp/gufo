@@ -2,6 +2,7 @@
 # only by explicit validation targets, not by production or routine checks.
 add_library(gufo_qwen38_flash_next STATIC
   config.cpp
+  lookup_cache.cpp
   ngram.cpp
   weights.cpp)
 
@@ -50,6 +51,7 @@ if (ENGINE_ENABLE_HIP)
   set(QFN_HIP_SOURCES
     ${QFN_ROCM_DIR}/kernels.hip.cpp
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
+    ${QFN_ROCM_DIR}/w8a8_wave32.hip
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
     ${QFN_ROCM_DIR}/executor.cpp

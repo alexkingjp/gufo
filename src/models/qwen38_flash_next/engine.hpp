@@ -16,7 +16,9 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/lookup_cache.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
+#include "src/models/qwen38_flash_next/snapshot_storage.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -41,6 +43,21 @@ struct ModelOptions {
   std::string mtp_model_path;
   /// Maximum proposals per cycle; acceptance history selects the length.
   std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
+  /// Substitute prompt-lookup followers into greedy MTP draft chains. The
+  /// MTP length controller keeps choosing widths; only proposal content is
+  /// affected, so verification cost and cost observations are unchanged.
+  bool prompt_lookup = false;
+  /// Quantize session K/V caches to packed q8_0 (executor::Options).
+  bool kv_quant = false;
+  /// Elastic session history budget (0 = legacy full-context
+  /// preallocation). Sessions size their K/V and pooled-key caches to
+  /// their content and double on demand; the executor-wide live total
+  /// stays within this budget. Frees the device memory fixed-shape
+  /// sessions waste on unused context, letting more lineages park warm.
+  std::size_t history_budget_bytes = 0;
+  /// Optional sink for elastic-history diagnostics (growth, budget
+  /// refusals); the server injects its logger.
+  std::function<void(std::string_view)> history_event_log;
   std::string vision_model_path;
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
@@ -49,6 +66,11 @@ struct ModelOptions {
 
 class Session;
 class SessionSnapshot;
+struct SessionSnapshotData;
+struct SnapshotStorageOwner;
+namespace snapshot {
+class Storage;
+}
 
 /// Gufo-owned API over the ROCm runtime: one resident model, any number of
 /// sessions with shared projection batches and independent context state.
@@ -89,6 +111,11 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  /// Device bytes of the position-scaled history families for one session
+  /// at `context` positions (the elastic pool's growth domain).
+  [[nodiscard]] std::size_t ElasticHistoryBytes(
+      core::SessionMode mode, std::uint32_t context) const noexcept;
+  [[nodiscard]] std::uint32_t history_initial_positions() const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
@@ -181,9 +208,16 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// Live device bytes of the elastic history families (zero outside
+  /// elastic mode). Reported separately so resource claims can reserve the
+  /// shared history budget instead of the full-context worst case.
+  [[nodiscard]] std::size_t HistoryBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
-  void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
+  void ResetDraftPolicy() noexcept {
+    draft_length_.Reset();
+    single_policy_.Reset();
+  }
 
   struct SpeculativeStats {
     std::uint64_t cycles{0};
@@ -195,9 +229,19 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 14;
-  /// Bytes a snapshot of the current context occupies.
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 15;
+  /// Full serialized bytes, not additive physical RAM ownership.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
+  /// Conservative pre-allocation bound, including snapshot metadata. Does not
+  /// assume the weak capture parent survives until SaveSnapshot.
+  [[nodiscard]] std::uint64_t SnapshotAllocationBytes() const;
+  /// Reservation estimate for a capture that shares append-only history with
+  /// the session's resident parent snapshot: the full allocation bound minus
+  /// the region data the parent would serve. Falls back to the full bound
+  /// when no pinned compatible parent exists. The caller must still treat
+  /// the estimate as advisory — SaveSnapshot revalidates the parent, and a
+  /// capture that exceeds the reservation fails closed.
+  [[nodiscard]] std::uint64_t SnapshotIncrementalBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
   /// state, draft-block state, last logits) into host memory. The
   /// speculative length controller is preserved for stochastic replay.
@@ -215,6 +259,9 @@ private:
   friend class Model;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
+  bool RestoreSnapshotImpl(std::span<const std::uint8_t> host,
+                           const snapshot::Storage* executor,
+                           std::string* error_msg);
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
@@ -238,6 +285,7 @@ private:
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {});
   static void AppendDraft(PendingDecode& pending);
+  void ApplyLookupProposals(PendingDecode* pending);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 
@@ -249,14 +297,22 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
+  // Runtime costs are request-local and never serialized into snapshots.
+  MtpBatchController single_policy_;
+  // Prompt-lookup followers over tokens_; rebuilt from the watermark after
+  // snapshot restore. Host-only state, not part of snapshot payloads.
+  lookup::ContextNgramCache lookup_cache_;
   SpeculativeStats stats_;
   std::vector<std::uint8_t> image_identity_;
+  // Frozen capture/restore lineage only; a live session never pins host
+  // history.
+  mutable std::weak_ptr<const SessionSnapshotData> snapshot_parent_;
   bool valid_{true};
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 
-/// Immutable host copy of a session context. The same bytes restore in
-/// memory and persist to disk.
+/// Immutable host context with shared append-only history and a boundary-local
+/// capsule. Persistent serialization remains the same contiguous byte format.
 class SessionSnapshot final {
 public:
   ~SessionSnapshot() = default;
@@ -265,17 +321,19 @@ public:
   SessionSnapshot(SessionSnapshot&&) = delete;
   SessionSnapshot& operator=(SessionSnapshot&&) = delete;
 
-  [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_; }
-  [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept {
-    return {data_.get(), size_};
-  }
+  [[nodiscard]] std::uint64_t SizeBytes() const noexcept;
   [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
+  /// Streams immutable spans in serialized order without a full-size staging
+  /// copy.
+  void StreamTo(
+      const std::function<void(std::span<const std::uint8_t>)>& sink) const;
+  [[nodiscard]] std::span<const SnapshotStorageOwner> StorageOwners()
+      const noexcept;
 
 private:
-  explicit SessionSnapshot(std::uint64_t size);
+  explicit SessionSnapshot(std::shared_ptr<const SessionSnapshotData> data);
 
-  std::unique_ptr<std::uint8_t[]> data_;
-  std::uint64_t size_{0};
+  std::shared_ptr<const SessionSnapshotData> data_;
 
   friend class Session;
 };

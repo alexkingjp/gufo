@@ -205,12 +205,13 @@ public:
         best = width;
       }
     }
-    // Fully accepted cohorts can qualify deeper shapes promptly. Stop
-    // forcing exploration once that physical width has warmed measurements.
+    // C1 costs can outlive a request's acceptance history. Its censored
+    // prefixes must still explore deeper chains after another request warmed
+    // those shapes. The per-session probe delay bounds repeated exploration.
     unsigned probe = cap;
     for (const auto& row : rows)
       probe = std::min(probe, row.acceptance->State().probe_depth);
-    if (probe > best && cell.samples[probe] < 2)
+    if (probe > best && (rows.size() == 1 || cell.samples[probe] < 2))
       return probe;
     // Bounded exploration learns wider costs and conditional acceptance;
     // it also lets an AR-only batch detect a change in the workload.
@@ -218,6 +219,8 @@ public:
       return std::min(cap, std::max(1U, best + 1));
     return best;
   }
+
+  void Reset() noexcept { *this = {}; }
 
   void Observe(std::size_t concurrency, std::uint32_t context,
                std::uint32_t drafts, float ms) noexcept {

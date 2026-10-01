@@ -329,9 +329,13 @@ std::optional<std::string> QwenChatTemplate::Render(
 std::optional<std::string> QwenChatTemplate::Render(
     std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
     const ChatTemplateOptions& options, std::string* error_msg,
-    std::vector<std::size_t>* image_offsets) {
+    std::vector<std::size_t>* image_offsets,
+    std::vector<ChatByteBoundary>* boundaries) {
   if (image_offsets != nullptr)
     image_offsets->clear();
+  if (boundaries != nullptr)
+    boundaries->clear();
+  std::vector<ChatByteBoundary> provenance;
   if (messages.empty()) {
     if (error_msg != nullptr) {
       *error_msg = "No messages provided";
@@ -411,8 +415,16 @@ std::optional<std::string> QwenChatTemplate::Render(
     output.append("<|im_start|>system\n");
     output.append(system_prefix);
     output.append("<|im_end|>\n");
+    provenance.push_back({ChatBoundaryKind::kSystemEnd, output.size()});
   }
 
+  std::size_t last_role_user_index = messages.size();
+  for (std::size_t index = messages.size(); index > 0; --index) {
+    if (messages[index - 1].role == ChatRole::kUser) {
+      last_role_user_index = index - 1;
+      break;
+    }
+  }
   std::size_t last_user_index = messages.size();
   for (std::size_t index = messages.size(); index > 0; --index) {
     if (messages[index - 1].role == ChatRole::kUser) {
@@ -458,6 +470,8 @@ std::optional<std::string> QwenChatTemplate::Render(
       output.append("<|im_end|>\n");
       continue;
     }
+    if (message_index == last_role_user_index)
+      provenance.push_back({ChatBoundaryKind::kLastUserStart, output.size()});
     const auto role_name = ToString(msg.role);
     output.append("<|im_start|>");
     output.append(role_name);
@@ -519,8 +533,10 @@ std::optional<std::string> QwenChatTemplate::Render(
     }
   }
 
+  provenance.push_back({ChatBoundaryKind::kHistoryEnd, output.size()});
   if (options.add_generation_prompt)
     output.append(GenerationPrompt(options.enable_thinking));
+  provenance.push_back({ChatBoundaryKind::kFullPrompt, output.size()});
 
   if (output.size() > options.max_output_bytes) {
     if (error_msg != nullptr) {
@@ -529,7 +545,35 @@ std::optional<std::string> QwenChatTemplate::Render(
     return std::nullopt;
   }
 
+  if (boundaries != nullptr)
+    *boundaries = std::move(provenance);
   return output;
+}
+
+std::vector<ChatTokenBoundary> QwenChatTemplate::VerifyTokenBoundaries(
+    const QwenTokenizer& tokenizer, std::string_view rendered,
+    std::span<const ChatByteBoundary> boundaries,
+    std::span<const TokenId> full_tokens) {
+  const TokenizerOptions options{
+      .add_bos = false, .add_eos = false, .parse_special_tokens = true};
+  // In particular, image-expanded token streams cannot use plain-text offsets.
+  if (!std::ranges::equal(tokenizer.Encode(rendered, options), full_tokens))
+    return {};
+  std::vector<ChatTokenBoundary> verified;
+  for (const auto& boundary : boundaries) {
+    if (boundary.byte_offset > rendered.size())
+      continue;
+    const auto prefix =
+        tokenizer.Encode(rendered.substr(0, boundary.byte_offset), options);
+    const auto count = static_cast<std::size_t>(
+        std::mismatch(prefix.begin(), prefix.end(), full_tokens.begin(),
+                      full_tokens.end())
+            .first -
+        prefix.begin());
+    if (count != 0)
+      verified.push_back({boundary.kind, count});
+  }
+  return verified;
 }
 
 std::string_view GenerationPrompt(bool enable_thinking) {

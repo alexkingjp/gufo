@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -175,21 +176,63 @@ Utf8CodePoint DecodeUtf8(std::string_view text, std::size_t offset) noexcept {
   return {.value = value, .length = length};
 }
 
+// ASCII byte classes for the pre-tokenizer fast path: bit flags mirroring
+// the Unicode general-category predicates below. ASCII has no marks and no
+// letter numbers, so the flags are exact.
+constexpr std::uint8_t kAsciiLetter = 1;
+constexpr std::uint8_t kAsciiLetterOrMark = 2;
+constexpr std::uint8_t kAsciiNumber = 4;
+constexpr std::uint8_t kAsciiWhitespace = 8;
+
+constexpr std::array<std::uint8_t, 256> MakeAsciiClass() {
+  std::array<std::uint8_t, 256> table{};
+  for (int c = 'A'; c <= 'Z'; ++c) {
+    table[c] = kAsciiLetter | kAsciiLetterOrMark;
+  }
+  for (int c = 'a'; c <= 'z'; ++c) {
+    table[c] = kAsciiLetter | kAsciiLetterOrMark;
+  }
+  for (int c = '0'; c <= '9'; ++c) {
+    table[c] = kAsciiNumber;
+  }
+  table['\t'] = kAsciiWhitespace;
+  table['\n'] = kAsciiWhitespace;
+  table['\v'] = kAsciiWhitespace;
+  table['\f'] = kAsciiWhitespace;
+  table['\r'] = kAsciiWhitespace;
+  table[' '] = kAsciiWhitespace;
+  return table;
+}
+
+constexpr auto kAsciiClass = MakeAsciiClass();
+
 bool IsUnicodeLetter(UChar32 value) noexcept {
+  if (static_cast<std::uint32_t>(value) < 0x80U) {
+    return (kAsciiClass[value] & kAsciiLetter) != 0;
+  }
   return (U_GET_GC_MASK(value) & U_GC_L_MASK) != 0;
 }
 
 bool IsUnicodeLetterOrMark(UChar32 value) noexcept {
+  if (static_cast<std::uint32_t>(value) < 0x80U) {
+    return (kAsciiClass[value] & kAsciiLetterOrMark) != 0;
+  }
   return (U_GET_GC_MASK(value) & (U_GC_L_MASK | U_GC_M_MASK)) != 0;
 }
 
 bool IsUnicodeNumber(UChar32 value) noexcept {
+  if (static_cast<std::uint32_t>(value) < 0x80U) {
+    return (kAsciiClass[value] & kAsciiNumber) != 0;
+  }
   const auto category = static_cast<UCharCategory>(u_charType(value));
   return category == U_DECIMAL_DIGIT_NUMBER || category == U_LETTER_NUMBER ||
          category == U_OTHER_NUMBER;
 }
 
 bool IsUnicodeWhitespace(UChar32 value) noexcept {
+  if (static_cast<std::uint32_t>(value) < 0x80U) {
+    return (kAsciiClass[value] & kAsciiWhitespace) != 0;
+  }
   return u_isUWhiteSpace(value) != 0;
 }
 
@@ -424,7 +467,8 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromVocabulary(
     tokenizer->token_to_id_[tokens[i]] = static_cast<TokenId>(i);
   }
 
-  // Parse BPE merges
+  // Parse BPE merges, resolving each rule's concatenated vocabulary entry
+  // once so the merge loop performs no string building.
   tokenizer->merge_ranks_.reserve(merges.size());
   for (std::uint32_t rank = 0; rank < merges.size(); ++rank) {
     const auto& merge = merges[rank];
@@ -439,7 +483,14 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromVocabulary(
     auto it2 = tokenizer->token_to_id_.find(part2);
     if (it1 != tokenizer->token_to_id_.end() &&
         it2 != tokenizer->token_to_id_.end()) {
-      tokenizer->merge_ranks_[{it1->second, it2->second}] = rank;
+      const std::string merged_str =
+          tokenizer->id_to_token_[it1->second] +
+          tokenizer->id_to_token_[it2->second];
+      const auto merged_it = tokenizer->token_to_id_.find(merged_str);
+      tokenizer->merge_ranks_[{it1->second, it2->second}] =
+          MergeTarget{rank, merged_it == tokenizer->token_to_id_.end()
+                                ? kInvalidTokenId
+                                : merged_it->second};
     }
   }
 
@@ -521,42 +572,117 @@ std::vector<TokenId> QwenTokenizer::BpeMergeChunk(
     }
   }
 
-  if (word_tokens.size() <= 1) {
+  const std::size_t n = word_tokens.size();
+  if (n <= 1) {
     return word_tokens;
   }
 
-  // Iteratively merge the highest-ranked adjacent pairs
-  while (word_tokens.size() >= 2) {
-    std::optional<std::uint32_t> best_rank;
-    std::size_t best_idx = 0;
-
-    for (std::size_t i = 0; i < word_tokens.size() - 1; ++i) {
-      auto it = merge_ranks_.find({word_tokens[i], word_tokens[i + 1]});
-      if (it != merge_ranks_.end()) {
-        if (!best_rank.has_value() || it->second < *best_rank) {
-          best_rank = it->second;
+  // Short pieces (the overwhelmingly common case: words, JSON punctuation)
+  // finish in a handful of merges, where the linear rescan over a few
+  // slots beats any queue. Long pieces — whitespace runs, code, minified
+  // blobs — would rescan O(n) pairs per merge for O(n^2) total, so they
+  // take the queue path below.
+  if (n <= 32) {
+    while (word_tokens.size() >= 2) {
+      const MergeTarget* best = nullptr;
+      std::size_t best_idx = 0;
+      for (std::size_t i = 0; i + 1 < word_tokens.size(); ++i) {
+        const auto it =
+            merge_ranks_.find({word_tokens[i], word_tokens[i + 1]});
+        if (it != merge_ranks_.end() &&
+            (best == nullptr || it->second.rank < best->rank)) {
+          best = &it->second;
           best_idx = i;
         }
       }
+      if (best == nullptr || best->merged == kInvalidTokenId) {
+        break;
+      }
+      word_tokens[best_idx] = best->merged;
+      word_tokens.erase(word_tokens.begin() +
+                        static_cast<std::ptrdiff_t>(best_idx + 1));
     }
-
-    if (!best_rank.has_value()) {
-      break;
-    }
-
-    const std::string merged_str = id_to_token_[word_tokens[best_idx]] +
-                                   id_to_token_[word_tokens[best_idx + 1]];
-    auto merged_it = token_to_id_.find(merged_str);
-    if (merged_it == token_to_id_.end()) {
-      break;
-    }
-
-    word_tokens[best_idx] = merged_it->second;
-    word_tokens.erase(word_tokens.begin() +
-                      static_cast<std::ptrdiff_t>(best_idx + 1));
+    return word_tokens;
   }
 
-  return word_tokens;
+  // Merge the lowest-ranked adjacent pair repeatedly, with the leftmost
+  // slot winning rank ties. A doubly linked list over the byte slots plus
+  // a lazy priority queue keeps this O(n log n) instead of rescanning
+  // every pair per merge; stale queue entries are discarded on pop.
+  constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+  std::vector<std::size_t> link_prev(n), link_next(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    link_prev[i] = i > 0 ? i - 1 : kNone;
+    link_next[i] = i + 1 < n ? i + 1 : kNone;
+  }
+  std::size_t head = 0;
+
+  struct QueueEntry {
+    std::uint32_t rank;
+    std::size_t left;
+    std::size_t right;
+    bool operator>(const QueueEntry& other) const {
+      if (rank != other.rank) {
+        return rank > other.rank;
+      }
+      return left > other.left;
+    }
+  };
+  std::priority_queue<QueueEntry, std::vector<QueueEntry>,
+                      std::greater<QueueEntry>>
+      queue;
+  const auto push_pair = [&](std::size_t left) {
+    const auto it =
+        merge_ranks_.find({word_tokens[left], word_tokens[link_next[left]]});
+    if (it != merge_ranks_.end()) {
+      queue.push({it->second.rank, left, link_next[left]});
+    }
+  };
+  for (std::size_t i = 0; i + 1 < n; ++i) {
+    push_pair(i);
+  }
+
+  while (!queue.empty()) {
+    const auto entry = queue.top();
+    queue.pop();
+    // The queue holds the state at push time; discard entries whose pair
+    // no longer exists in the linked list with the same rank.
+    if (link_next[entry.left] != entry.right) {
+      continue;
+    }
+    const auto it =
+        merge_ranks_.find({word_tokens[entry.left], word_tokens[entry.right]});
+    if (it == merge_ranks_.end() || it->second.rank != entry.rank) {
+      continue;
+    }
+    if (it->second.merged == kInvalidTokenId) {
+      break;
+    }
+
+    word_tokens[entry.left] = it->second.merged;
+    link_next[entry.left] = link_next[entry.right];
+    if (link_next[entry.right] != kNone) {
+      link_prev[link_next[entry.right]] = entry.left;
+    }
+    link_prev[entry.right] = kNone;
+    link_next[entry.right] = kNone;
+    if (entry.right == head) {
+      head = entry.left;
+    }
+    if (link_prev[entry.left] != kNone) {
+      push_pair(link_prev[entry.left]);
+    }
+    if (link_next[entry.left] != kNone) {
+      push_pair(entry.left);
+    }
+  }
+
+  std::vector<TokenId> merged_tokens;
+  merged_tokens.reserve(n);
+  for (std::size_t i = head; i != kNone; i = link_next[i]) {
+    merged_tokens.push_back(word_tokens[i]);
+  }
+  return merged_tokens;
 }
 
 std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {

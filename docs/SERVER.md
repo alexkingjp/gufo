@@ -10,7 +10,8 @@ versioned contract: supported fields behave as documented, and unsupported
 fields return explicit errors.
 
 Chat Completions is the main API, including streaming, images and tools.
-Responses and Anthropic Messages currently expose synchronous text subsets.
+Responses exposes buffered and streaming text subsets. Anthropic Messages
+currently exposes a synchronous text subset.
 The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
@@ -131,6 +132,15 @@ and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities
 must match the retained prefix.
 
+The in-memory cache retains up to 24 immutable checkpoints independently of the
+number of preallocated GPU sessions. A separate host-memory byte budget bounds
+retained snapshots and in-progress captures, including payloads being restored
+or destroyed. Entry and byte limits use LRU eviction; no additional GPU session
+state is allocated to increase checkpoint retention. The byte budget is measured
+after session construction and does not adapt to later external memory pressure.
+If a snapshot cannot fit, live continuation still works but an interleaved
+conversation may need to prefill again.
+
 For a focused cancellation check, run
 `python3 tools/serving/check-continuation.py --output /tmp/cache-check.json`
 against a private server named `cache-test` on port 5815.
@@ -218,7 +228,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/v1/models` | List loaded model aliases and capabilities |
-| `POST` | `/v1/responses` | Synchronous text subset |
+| `POST` | `/v1/responses` | Buffered and streaming text subset |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness (aliases: `/v1/health`, `/healthz`) |
@@ -392,14 +402,48 @@ request limits, cancellation, cache accounting and completion state.
 ## Responses API Subset
 
 `POST /v1/responses` accepts `model`, `input` as text or text-message arrays,
-`instructions`, `max_output_tokens`, and the shared sampling controls. Clients
-supply the complete conversation. `store`, `background` and `stream` must be
-false when present. Images, tools, structured output, server-side conversations
-and `previous_response_id` are rejected on this route. Use Chat Completions for
-validated image, tool and streaming support.
+`instructions`, `max_output_tokens`, `stream`, and the shared sampling controls.
+`reasoning_effort` and `reasoning.effort` use the chat adapter's reasoning
+validation. The output budget includes reasoning and visible text. Clients
+supply the complete conversation. `store` and `background` must be false when
+present. Flat function tools, function-call history and function-call outputs
+are accepted. Responses `text.format` maps to Chat `response_format` for
+constrained JSON. Images, built-in/custom/namespace tools, server-side
+conversations and `previous_response_id` remain unsupported.
 
-Responses report `incomplete` with reason `max_output_tokens` when generation
-hits its limit. Otherwise they report `completed`.
+Function output items carry a stable item `id`, a distinct `call_id`, the exact
+function name and JSON-string `arguments`. Replay these items followed by
+`function_call_output` items with matching call IDs; outputs may be strings or
+text-part arrays. Parallel results are correlated by ID and rendered in call
+order. Missing, duplicate and orphan outputs are rejected. Tool definitions can
+change across turns without erasing historical calls.
+
+Both buffered and streaming responses include function-call items. Streaming
+emits argument delta/done and output-item done events only for a validated call
+batch; arguments are buffered until validation, not streamed speculatively to an
+executable tool. `parallel_tool_calls=false` rejects multiple generated calls.
+Malformed or undeclared calls invalidate a mixed batch rather than exposing an
+earlier valid call. The server never executes functions itself.
+
+`include:["reasoning.encrypted_content"]` is accepted as an advisory selection;
+no encrypted reasoning is fabricated. Raw reasoning replay remains supported.
+`text.verbosity`, reasoning summaries and stateful continuation controls remain
+explicitly unsupported.
+
+Streaming emits ordered Responses lifecycle, output-item, content-part and
+text/reasoning delta events with sequence numbers. Validation and admission
+errors remain ordinary HTTP errors; failures after streaming begins emit a
+failed terminal response. Responses report `incomplete` with reason
+`max_output_tokens` when generation hits its limit; otherwise they report
+`completed`. Input/output/total and cached-token usage are reported. A separate
+reasoning-token count is unavailable and is omitted rather than estimated.
+
+The endpoint's raw `reasoning_text` output item can be replayed immediately
+before its assistant message in the next request's `input`. It is reconstructed
+as assistant reasoning history. A reasoning-only incomplete output becomes an
+assistant turn with empty visible content when followed by another role or the
+end of input. Malformed or empty raw reasoning items, encrypted reasoning, and
+summary-only reasoning are rejected.
 
 The other compatibility routes are deliberately limited:
 
@@ -410,8 +454,9 @@ The other compatibility routes are deliberately limited:
 | `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
 All four routes validate the loaded model, positive integer limits and shared
-sampling controls. They reject unsupported streaming, multiple candidates,
-stop strings and other generation controls instead of ignoring them.
+sampling controls. The three synchronous compatibility routes reject streaming;
+all reject multiple candidates, stop strings and other unsupported generation
+controls instead of ignoring them.
 `/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
 and template-aware message counting are not implemented.
 
@@ -421,13 +466,13 @@ and template-aware message counting are not implemented.
 
 - `model`
 - `messages`
-- `max_tokens` or `max_completion_tokens`
+- `max_tokens`, `max_completion_tokens`, or `max_output_tokens` (agree if combined; cap 65536)
 - `temperature`
 - `top_p`
 - `seed`
 - `stream`
 - `stream_options.include_usage`
-- `tools` and `tool_choice` when supported
+- `tools`, `tool_choice`, `parallel_tool_calls`, and `response_format` when supported
 - shared top-k, min-p, repeat, frequency and presence sampling controls
 
 Streaming objects use `chat.completion.chunk` and end with the compatibility
@@ -443,12 +488,61 @@ repetition penalty. Speculative rejection discards tentative counts; seeded
 sampling replay retains independent request histories.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
-calling tools. An unmet `required` choice returns `tool_choice_unsatisfied`
-(HTTP 502, or an SSE error after streaming starts).
+calling tools. A named choice, `{"type":"function","function":{"name":"..."}}`,
+requires an exact, uniquely declared name and uses the complete selected tool
+as the required output allowlist. Historical tool calls are preserved. This is
+prompting plus output validation, not grammar-constrained argument decoding.
+An unmet required or named choice returns `tool_choice_unsatisfied` (HTTP 502,
+or an SSE error after streaming starts).
 
 Admission groups text requests by the socket peer's IP address across chat and
 compatibility endpoints. Caller-provided identity headers do not affect quotas;
 clients behind the same proxy or NAT share a peer quota.
+
+## Constrained JSON and strict tools
+
+Chat `response_format` accepts `json_object` and `json_schema` (with nested
+`json_schema:{name,schema,strict}`). Responses accepts flattened
+`text.format:{type:"json_schema",name,schema,strict}` or `json_object`.
+The generated document is still response text, not a new HTTP envelope.
+
+Qwen3.8-Flash-Next implements byte-level token constraints for greedy requests
+(`temperature:0`). Constrained requests use single-token target decoding rather
+than speculative proposals. Ordinary requests retain MTP. A copied sampler owns
+an independent constraint cursor; preview, queued requests and cache reuse never
+share mutable grammar. EOS/PAD are unavailable before a complete result.
+
+Reasoning remains separate and unconstrained until its closing delimiter. The
+answer route is constrained JSON or a tool call when tools are active. Tool-only
+turns do not require a final JSON document. JSON strings containing literal
+thinking/tool markers are preserved. Token budgets cover all phases. Truncation
+reports length/incomplete without repairing or inventing closing syntax.
+
+Supported schema assertions are types (including nullable unions), properties,
+required, additionalProperties, items, min/maxItems, min/maxLength, enum, const,
+anyOf, conservatively proven-disjoint oneOf, and bounded local references.
+Unsupported keywords, including pattern, format, numeric bounds, multipleOf,
+allOf/not/conditionals and remote references, fail preflight. Annotations do not
+insert defaults. Generation uses a bounded valid subset with fixed property
+order; no permutation of arbitrary JSON Schema behavior is promised.
+
+Schemas are bounded by 256 KiB input, 16,384 schema nodes, 65,536 grammar nodes,
+one million aggregate compile/proof steps, 4,096 active parser states, 32
+container levels, 128 reference hops, 256 combined recursion frames, 256
+properties/items, 4,096 string scalars and one MiB output. Whitespace and numeric
+lexemes are bounded. Resource exhaustion fails closed. Numeric const/enum values
+that lose decimal precision through the shared JSON AST are rejected, not
+rounded into a different constraint. A completed result passes an independent
+parse/structural validation gate before a successful terminal event.
+
+`strict:true` function schemas use the same supported schema validator. Each
+object must set additionalProperties:false and require every declared property;
+nullable unions represent optional values. Entire generated batches are parsed
+and validated before tool items are emitted. This is fail-closed argument
+validation, not grammar-constrained argument generation: invalid calls return a
+generation error, never silently repaired/coerced arguments. Non-strict tools
+retain their normal optional-property semantics. Named-tool constraints do not
+change historical tool messages.
 
 ## Model Discovery
 

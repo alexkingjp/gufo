@@ -16,6 +16,28 @@ inline double PrefillTokensPerSecond(
                                  : 0.0;
 }
 
+inline double ActiveDecodeTokensPerSecond(
+    const TextGenerationBackend::Result& result) {
+  return result.decode_ms > 0.0
+             ? 1000.0 * result.completion_tokens / result.decode_ms
+             : 0.0;
+}
+
+inline double DecodeWallTokensPerSecond(
+    const TextGenerationBackend::Result& result) {
+  return result.decode_wall_ms > 0.0
+             ? 1000.0 * result.completion_tokens / result.decode_wall_ms
+             : 0.0;
+}
+
+inline double GenerationWallTokensPerSecond(
+    const TextGenerationBackend::Result& result) {
+  return result.total_generation_wall_ms > 0.0
+             ? 1000.0 * result.completion_tokens /
+                   result.total_generation_wall_ms
+             : 0.0;
+}
+
 inline std::string GenerationLogDetails(
     const TextGenerationBackend::Result& result) {
   std::ostringstream out;
@@ -35,11 +57,26 @@ inline std::string GenerationLogDetails(
       << " cache_restore_ms=" << result.cache_restore_ms
       << " queue_depth=" << result.queue_depth_at_submit
       << " resident_at_admission=" << result.resident_requests_at_admission
-      << " queue_ms=" << result.queue_ms << " ttft_ms=" << result.ttft_ms
-      << " prefill_tps=" << PrefillTokensPerSecond(result) << " decode_tps="
-      << (result.decode_ms > 0
-              ? 1000.0 * result.completion_tokens / result.decode_ms
-              : 0.0)
+      << " request_id=" << result.request_id
+      << " resident_at_submit=" << result.resident_requests_at_submit
+      << " inflight_at_submit=" << result.inflight_requests_at_submit
+      << " client_inflight_at_submit="
+      << result.client_inflight_requests_at_submit
+      << " effective_prefill_tokens=" << result.effective_prefill_tokens
+      << " queue_ms=" << result.queue_ms
+      << " queue_admission_ms=" << result.queue_admission_ms
+      << " resident_wait_ms=" << result.resident_wait_ms
+      << " peer_prefill_ms=" << result.peer_prefill_ms
+      << " snapshot_wait_ms=" << result.snapshot_wait_ms
+      << " total_generation_wall_ms=" << result.total_generation_wall_ms
+      << " decode_wall_ms=" << result.decode_wall_ms
+      << " first_token_emitted=" << result.first_token_emitted
+      << " ttft_ms=" << result.ttft_ms
+      << " max_prefill_chunk_ms=" << result.max_prefill_chunk_ms
+      << " prefill_tps=" << PrefillTokensPerSecond(result)
+      << " active_decode_tps=" << ActiveDecodeTokensPerSecond(result)
+      << " decode_wall_tps=" << DecodeWallTokensPerSecond(result)
+      << " generation_wall_tps=" << GenerationWallTokensPerSecond(result)
       << " batch_width=" << result.physical_execution_width
       << " plan=" << result.execution_plan
       << " draft_accepted=" << result.draft_accepted_tokens
@@ -79,6 +116,20 @@ inline json::Value GenerationTimings(
       result.decode_ms > 0.0 ? static_cast<double>(result.completion_tokens) *
                                    1000.0 / result.decode_ms
                              : 0.0;
+  // Keep legacy active-work fields for compatibility, but label their basis.
+  timings["predicted_time_basis"] = "active_decode";
+  timings["active_decode_ms"] = result.decode_ms;
+  timings["active_decode_per_second"] = ActiveDecodeTokensPerSecond(result);
+  timings["decode_wall_ms"] = result.decode_wall_ms;
+  timings["decode_wall_per_second"] = DecodeWallTokensPerSecond(result);
+  timings["total_generation_wall_ms"] = result.total_generation_wall_ms;
+  timings["generation_wall_per_second"] = GenerationWallTokensPerSecond(result);
+  timings["queue_admission_ms"] = result.queue_admission_ms;
+  timings["resident_wait_ms"] = result.resident_wait_ms;
+  timings["peer_prefill_ms"] = result.peer_prefill_ms;
+  timings["snapshot_wait_ms"] = result.snapshot_wait_ms;
+  timings["first_token_emitted"] = result.first_token_emitted;
+  timings["ttft_ms"] = result.ttft_ms;
   timings["cache_n"] = result.cached_prompt_tokens;
   timings["cache_restore_ms"] = result.cache_restore_ms;
   timings["cache_snapshot_ms"] = result.cache_snapshot_ms;

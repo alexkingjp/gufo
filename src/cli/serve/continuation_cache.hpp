@@ -31,6 +31,13 @@ public:
   virtual void Invalidate() noexcept = 0;
 };
 
+/// Physical immutable allocation identity; all aliases use the same
+/// owner.get().
+struct ContinuationSnapshotStorageOwner {
+  std::shared_ptr<const void> owner;
+  std::size_t bytes{0};
+};
+
 /// Immutable model-private continuation payload.
 class ContinuationSnapshot {
 public:
@@ -43,6 +50,12 @@ public:
   ContinuationSnapshot& operator=(ContinuationSnapshot&&) = delete;
 
   [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
+  /// Empty uses the legacy one-payload accounting contract. Otherwise this
+  /// immutable span covers every physical allocation, including metadata.
+  [[nodiscard]] virtual std::span<const ContinuationSnapshotStorageOwner>
+  StorageOwners() const noexcept {
+    return {};
+  }
 };
 
 enum class SnapshotEventAction : std::uint8_t {
@@ -78,10 +91,18 @@ struct ContinuationLookup {
   std::size_t checkpoint_tokens{0};
 };
 
+/// The resident continuation of one free execution slot: a queued request
+/// whose input identity matches can adopt this slot without any restore.
+struct SlotLineage {
+  std::size_t slot{0};
+  std::size_t live_tokens{0};
+  std::vector<std::uint8_t> identity;
+};
+
 /// Bounded exact-prefix cache over opaque model continuation states.
 ///
-/// The first deployment uses one entry. Supporting a bounded entry count here
-/// keeps cache policy independent from Qwen, DeepSeek, and future providers.
+/// Mutable execution slots and immutable snapshot retention have independent
+/// bounds. Retaining more conversations never allocates more model states.
 class ContinuationCache {
 public:
   using StateFactory = std::function<std::unique_ptr<ContinuationState>()>;
@@ -95,6 +116,8 @@ public:
     SnapshotRestore restore;
     SnapshotCapacity capacity_bytes;
     SnapshotEventSink on_event;
+    /// Independent of mutable state capacity; the byte budget also applies.
+    std::size_t entry_capacity{24};
   };
 
   class Lease {
@@ -133,9 +156,13 @@ public:
     /// Reserves aggregate retained-snapshot capacity before model allocation.
     ///
     /// Byte-pressure evictions happen synchronously before this returns true.
+    /// preserve_source pins the fallback against all peers for this lease.
+    /// allow_eviction=false is optional early admission: no eviction, and leave
+    /// at least one same-sized ordinary capture's headroom in the byte budget.
     [[nodiscard]] bool TryReserveSnapshot(std::size_t snapshot_bytes,
                                           std::size_t token_count,
-                                          bool preserve_source = false);
+                                          bool preserve_source = false,
+                                          bool allow_eviction = true);
 
     /// Releases an admitted reservation and records a sanitized skip reason.
     void SkipSnapshot(SnapshotEventReason reason, std::size_t snapshot_bytes,
@@ -164,24 +191,26 @@ public:
     friend class ContinuationCache;
 
     Lease(ContinuationCache* cache, std::size_t index, bool cache_hit,
-          std::size_t cached_tokens, std::size_t source_index,
+          std::size_t cached_tokens, std::uint64_t source_id,
           std::size_t restored_snapshot_bytes, double restore_ms) noexcept;
 
     ContinuationCache* cache_{nullptr};
     std::size_t index_{0};
     bool cache_hit_{false};
     std::size_t cached_tokens_{0};
-    std::size_t source_index_{0};
+    std::uint64_t source_id_{0};
     std::size_t restored_snapshot_bytes_{0};
     double restore_ms_{0.0};
     bool restored_from_disk_{false};
     std::size_t reserved_snapshot_bytes_{0};
+    bool preserve_source_{false};
     std::vector<std::uint8_t> input_identity_;
     ContinuationLookup lookup_;
   };
 
+  ContinuationCache(std::size_t capacity, const StateFactory& factory);
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
-                    SnapshotSupport snapshot_support = {});
+                    SnapshotSupport snapshot_support);
   ~ContinuationCache();
 
   ContinuationCache(const ContinuationCache&) = delete;
@@ -194,30 +223,45 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::span<const std::uint8_t> input_identity = {},
       const std::function<void(ContinuationState&)>& prepare_state = {},
-      bool reuse_prompt = true);
+      bool reuse_prompt = true, std::size_t min_cached_tokens = 0);
 
+  /// Learns from exact compatible retained/live histories, before a lease
+  /// replaces them. Stores only bounded candidate prefixes, never whole
+  /// prompts.
+  [[nodiscard]] std::vector<std::size_t> LearnPrefixBoundaries(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity, std::size_t min_tokens);
+
+  /// Number of mutable execution slots, not retained snapshot entries.
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t snapshot_entry_capacity() const noexcept;
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
   [[nodiscard]] std::size_t retained_snapshot_bytes() const noexcept;
   [[nodiscard]] std::size_t reserved_snapshot_bytes() const noexcept;
+  /// Resident lineages of currently free execution slots. Admission uses
+  /// this to hand a freed slot back to the queued request that can reuse
+  /// its live state instead of restoring from a snapshot.
+  [[nodiscard]] std::vector<SlotLineage> FreeSlotLineages() const;
 
 private:
   struct Entry;
 
   [[nodiscard]] ContinuationState& StateAt(std::size_t index);
-  [[nodiscard]] bool ReserveSnapshot(std::size_t source_index,
+  void ProtectSource(std::uint64_t source_id, bool protect) noexcept;
+  [[nodiscard]] bool ReserveSnapshot(std::uint64_t source_id,
                                      std::size_t snapshot_bytes,
                                      std::size_t token_count,
-                                     bool preserve_source);
+                                     bool preserve_source, bool allow_eviction);
   void SkipSnapshot(std::size_t reservation_bytes, SnapshotEventReason reason,
                     std::size_t snapshot_bytes,
                     std::size_t token_count) noexcept;
   [[nodiscard]] std::size_t Commit(
-      std::size_t index, std::size_t source_index,
-      std::size_t reservation_bytes, std::vector<ContinuationToken> tokens,
+      std::size_t index, std::uint64_t source_id, std::size_t reservation_bytes,
+      std::vector<ContinuationToken> tokens,
       std::shared_ptr<const ContinuationSnapshot> snapshot,
       std::vector<std::uint8_t> input_identity,
-      std::vector<ContinuationToken> live_tokens, bool release_state = true);
+      std::vector<ContinuationToken> live_tokens, bool release_state = true,
+      bool preserve_source = false, std::uint64_t* published_id = nullptr);
   void Invalidate(std::size_t index, std::size_t reservation_bytes) noexcept;
 
   struct Impl;

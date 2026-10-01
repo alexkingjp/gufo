@@ -82,7 +82,12 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
       per_state_reservation.has_value()) {
     const std::size_t per_request = *per_state_reservation;
     const std::size_t capacity = *resources.state_capacity_bytes;
-    if (per_request != 0 && state_count > capacity / per_request) {
+    // Shared pools (elastic history budgets) are reserved once for all
+    // states; only the remainder is divided into per-state slices.
+    const std::size_t shared =
+        std::min(resources.shared_state_bytes.value_or(0), capacity);
+    const std::size_t shared_left = capacity - shared;
+    if (per_request != 0 && state_count > shared_left / per_request) {
       throw std::invalid_argument(
           "text runner request-state claim exceeds state capacity");
     }
@@ -334,6 +339,9 @@ TextDecodeStep TextModelRunner::DecodeStep(
   }
   auto selection = SelectNext(state, sampler);
   if (selection.stop) {
+    if (sampler.has_constraint() && !sampler.constraint_complete())
+      throw std::runtime_error(
+          "runner stopped before structured output completed");
     return {
         .selections = {},
         .draft_tokens = 0,
@@ -373,6 +381,16 @@ std::unique_ptr<TextRunnerSnapshot> TextModelRunner::Snapshot(
 std::size_t TextModelRunner::SnapshotPayloadBytes(
     const TextRunnerState&) const {
   throw std::logic_error("text runner does not support snapshot sizing");
+}
+
+std::size_t TextModelRunner::SnapshotAllocationBytes(
+    const TextRunnerState& state) const {
+  return SnapshotPayloadBytes(state);
+}
+
+std::size_t TextModelRunner::SnapshotIncrementalBytes(
+    const TextRunnerState& state) const {
+  return SnapshotAllocationBytes(state);
 }
 
 void TextModelRunner::RestoreOrFork(TextRunnerState&,
@@ -455,21 +473,28 @@ struct TextRunnerPool::Request::Impl {
        ContinuationCache::Lease state_lease,
        std::vector<TextRunnerToken> prompt_tokens,
        std::vector<std::size_t> shared_prefix_boundaries,
+       std::optional<TextCacheBoundary> prefix_checkpoint,
        const sampling::SamplingConfig& sampling_config,
        std::shared_ptr<const TextPromptContext> prompt_context,
-       std::size_t cache_prefix_tokens)
+       std::size_t cache_prefix_tokens,
+       std::shared_ptr<const sampling::TokenConstraint> json_constraint)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
         prompt(std::move(prompt_tokens)),
         boundaries(std::move(shared_prefix_boundaries)),
+        early_boundary(prefix_checkpoint),
         prefill_offset(lease.cached_tokens()),
         decode_ready(prefill_offset == prompt.size()),
-        sampler(sampling_config, prompt),
+        sampler(sampling_config, prompt, std::move(json_constraint)),
         context(std::move(prompt_context)) {
     const auto count =
         cache_prefix_tokens == 0 ? prompt.size() : cache_prefix_tokens;
     snapshot_tokens.assign(prompt.begin(), prompt.begin() + count);
+    if (early_boundary) {
+      snapshot_metrics.prefix_checkpoint_kind = early_boundary->kind;
+      snapshot_metrics.prefix_checkpoint_tokens = early_boundary->token_count;
+    }
     // A live continuation can already be beyond the desired snapshot point.
     // Keep its existing immutable checkpoint; never snapshot mismatched state.
     prompt_snapshot_attempted = prefill_offset > count;
@@ -484,12 +509,24 @@ struct TextRunnerPool::Request::Impl {
   ~Impl() {
     // The worker borrows this lease's state; join before any field is
     // destroyed.
-    if (snapshot_future.valid())
-      snapshot_future.wait();
+    DiscardCapture();
+  }
+
+  void DiscardCapture() noexcept {
+    if (snapshot_future.valid()) {
+      try {
+        auto pending = snapshot_future.get();
+        pending.reset();
+      } catch (...) {
+        // Failed capture owns no payload; the lease still releases reservation.
+      }
+    }
+    prompt_snapshot.reset();
+    disk_capture.reset();
   }
 
   void CapturePromptSnapshot(bool wait = true) noexcept {
-    if (!prompt_snapshot_attempted)
+    if (!prompt_snapshot_attempted && !snapshot_future.valid())
       StartPromptSnapshot();
     if (!snapshot_future.valid())
       return;
@@ -528,13 +565,20 @@ struct TextRunnerPool::Request::Impl {
       return;
     }
     snapshot_bytes = 0;
+    std::size_t snapshot_reservation_bytes = 0;
     try {
       if (runner->CheckpointPosition(*state) != snapshot_tokens.size()) {
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, 0,
                            snapshot_tokens.size());
         return;
       }
-      snapshot_bytes = runner->SnapshotPayloadBytes(*state);
+      logical_snapshot_bytes = runner->SnapshotPayloadBytes(*state);
+      snapshot_bytes = runner->SnapshotAllocationBytes(*state);
+      // RAM retention reserves only the bytes not already retained from the
+      // state's pinned parent; the cache re-deduplicates at commit and fails
+      // closed if the true delta exceeds this estimate. Disk captures store
+      // whole payloads and keep reserving the full size.
+      snapshot_reservation_bytes = runner->SnapshotIncrementalBytes(*state);
     } catch (...) {
       lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, 0,
                          snapshot_tokens.size());
@@ -543,8 +587,8 @@ struct TextRunnerPool::Request::Impl {
 
     retain_snapshot = false;
     try {
-      retain_snapshot =
-          lease.TryReserveSnapshot(snapshot_bytes, snapshot_tokens.size());
+      retain_snapshot = lease.TryReserveSnapshot(snapshot_reservation_bytes,
+                                                 snapshot_tokens.size(), true);
     } catch (...) {
       return;
     }
@@ -575,6 +619,10 @@ struct TextRunnerPool::Request::Impl {
   }
 
   void FinishPromptSnapshot() noexcept {
+    if (early_snapshot_pending) {
+      FinishEarlySnapshot();
+      return;
+    }
     try {
       prompt_snapshot = snapshot_future.get();
     } catch (...) {
@@ -593,12 +641,28 @@ struct TextRunnerPool::Request::Impl {
       return;
     }
 
-    if (retain_snapshot && prompt_snapshot->PayloadBytes() != snapshot_bytes) {
+    if (prompt_snapshot->PayloadBytes() != logical_snapshot_bytes) {
+      const auto actual_bytes = prompt_snapshot->PayloadBytes();
+      prompt_snapshot.reset();
       lease.SkipSnapshot(SnapshotEventReason::kReservationMismatch,
-                         prompt_snapshot->PayloadBytes(),
-                         snapshot_tokens.size());
+                         actual_bytes, snapshot_tokens.size());
       retain_snapshot = false;
+      disk_capture.reset();
+      return;
     }
+    if (retain_snapshot) {
+      try {
+        snapshot_metrics.snapshot_bytes =
+            lease.PublishSnapshot(snapshot_tokens, prompt_snapshot);
+      } catch (...) {
+        prompt_snapshot.reset();
+        lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
+                           snapshot_tokens.size());
+        return;
+      }
+    }
+    // Publish RAM ownership before handing another reference to disk. Both
+    // retained and rejected external payloads stay accounted until destroyed.
     // Charge disk-only snapshots immediately. Holding them until commit would
     // let concurrent requests each pass the same queue-capacity preflight.
     const bool already_persisted =
@@ -620,8 +684,70 @@ struct TextRunnerPool::Request::Impl {
               .count();
     }
     disk_capture.reset();
-    if (!retain_snapshot)
-      prompt_snapshot.reset();
+    prompt_snapshot.reset();
+  }
+
+  void StartEarlySnapshot() noexcept {
+    if (!early_boundary || snapshot_future.valid())
+      return;
+    const auto position = early_boundary->token_count;
+    early_boundary.reset();
+    try {
+      const auto prefix =
+          std::span<const TextRunnerToken>(prompt).first(position);
+      if (lease.HasSnapshotFor(prefix))
+        return;
+      const auto& state = dynamic_cast<const TextRunnerState&>(lease.state());
+      if (runner->CheckpointPosition(state) != position)
+        return;
+      logical_snapshot_bytes = runner->SnapshotPayloadBytes(state);
+      snapshot_bytes = runner->SnapshotAllocationBytes(state);
+      // Extra checkpoints never evict a viable source just to try a capture,
+      // and reserve only the bytes not already retained from the state's
+      // pinned parent snapshot.
+      if (!lease.TryReserveSnapshot(runner->SnapshotIncrementalBytes(state),
+                                    position, true, false))
+        return;
+      early_snapshot_pending = true;
+      snapshot_start = std::chrono::steady_clock::now();
+      snapshot_future = std::async(
+          std::launch::async,
+          [owner = runner, state = &state] { return owner->Snapshot(*state); });
+    } catch (...) {
+      early_snapshot_pending = false;
+      lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
+                         position);
+      ++snapshot_metrics.prefix_checkpoint_failures;
+    }
+  }
+
+  void FinishEarlySnapshot() noexcept {
+    early_snapshot_pending = false;
+    const auto position = snapshot_metrics.prefix_checkpoint_tokens;
+    std::shared_ptr<const TextRunnerSnapshot> snapshot;
+    try {
+      snapshot = snapshot_future.get();
+      if (!snapshot || snapshot->PayloadBytes() != logical_snapshot_bytes)
+        throw std::runtime_error("early snapshot payload mismatch");
+      const auto prefix =
+          std::span<const TextRunnerToken>(prompt).first(position);
+      snapshot_metrics.prefix_checkpoint_bytes =
+          lease.PublishSnapshot({prefix.begin(), prefix.end()}, snapshot);
+      if (snapshot_metrics.prefix_checkpoint_bytes != 0 && disk_store) {
+        (void)disk_store->SaveAsync(
+            runner, {prefix.begin(), prefix.end()}, snapshot,
+            {InputIdentity().begin(), InputIdentity().end()});
+      }
+    } catch (...) {
+      snapshot.reset();
+      lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
+                         position);
+      ++snapshot_metrics.prefix_checkpoint_failures;
+    }
+    snapshot_metrics.prefix_checkpoint_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - snapshot_start)
+            .count();
   }
 
   /// Persists the continuation at a shared-prefix boundary reached by prefill.
@@ -652,9 +778,10 @@ struct TextRunnerPool::Request::Impl {
       if (disk_store->Touch(*runner, prefix, InputIdentity())) {
         return;
       }
-      if (!disk_store->CanSave(*runner, position,
-                               runner->SnapshotPayloadBytes(state),
-                               InputIdentity()))
+      auto reservation = disk_store->ReserveCapture(
+          *runner, position, runner->SnapshotAllocationBytes(state),
+          InputIdentity());
+      if (!reservation)
         return;
       std::shared_ptr<const TextRunnerSnapshot> snapshot =
           runner->Snapshot(state);
@@ -663,7 +790,8 @@ struct TextRunnerPool::Request::Impl {
       }
       const auto saved = disk_store->SaveAsync(
           runner, {prefix.begin(), prefix.end()}, std::move(snapshot),
-          {InputIdentity().begin(), InputIdentity().end()});
+          {InputIdentity().begin(), InputIdentity().end()},
+          std::move(reservation));
       if (saved != 0) {
         ++snapshot_metrics.shared_prefix_snapshots;
         snapshot_metrics.shared_prefix_bytes += saved;
@@ -688,6 +816,8 @@ struct TextRunnerPool::Request::Impl {
   std::vector<TextRunnerToken> snapshot_tokens;
   /// Ascending prefill positions to persist, all inside (cached, prompt size).
   std::vector<std::size_t> boundaries;
+  std::optional<TextCacheBoundary> early_boundary;
+  bool early_snapshot_pending{false};
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
@@ -706,6 +836,7 @@ struct TextRunnerPool::Request::Impl {
   std::shared_ptr<const TextRunnerSnapshot> prompt_snapshot;
   TextRunnerPool::Request::CommitMetrics snapshot_metrics;
   std::size_t snapshot_bytes{0};
+  std::size_t logical_snapshot_bytes{0};
   bool retain_snapshot{false};
   std::chrono::steady_clock::time_point snapshot_start;
   std::unique_ptr<ContinuationDiskStore::CaptureReservation> disk_capture;
@@ -740,8 +871,13 @@ TextRunnerPool::Request::PreviewFirstToken() {
       impl_->pending_selection || impl_->stopped)
     return std::nullopt;
   auto sampler = impl_->sampler;
-  return impl_->runner->PreviewFirstToken(
+  auto preview = impl_->runner->PreviewFirstToken(
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), sampler);
+  if (preview && preview->stop && sampler.has_constraint() &&
+      !sampler.constraint_complete())
+    throw std::runtime_error(
+        "runner preview stopped before structured output completed");
+  return preview;
 }
 
 TextRunnerPool::Request::~Request() = default;
@@ -859,6 +995,15 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   impl_->decode_ready = reached_frontier;
   step.decode_ready = reached_frontier;
   impl_->state_reusable = true;
+  // Do not split the provider's ordinary prefill shape for the early tap.
+  // A scheduler quantum crossing it simply forgoes this optional checkpoint.
+  if (impl_->early_boundary &&
+      impl_->prefill_offset >= impl_->early_boundary->token_count) {
+    if (impl_->prefill_offset == impl_->early_boundary->token_count)
+      impl_->StartEarlySnapshot();
+    else
+      impl_->early_boundary.reset();
+  }
   if (!reached_frontier && impl_->prefill_offset == snapshot_position)
     impl_->CapturePromptSnapshot(false);
   if (!impl_->boundaries.empty() &&
@@ -890,6 +1035,10 @@ TextDecodeSelection TextRunnerPool::Request::SelectNext() {
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), impl_->sampler);
   impl_->state_reusable = true;
   if (selection.stop) {
+    if (impl_->sampler.has_constraint() &&
+        !impl_->sampler.constraint_complete())
+      throw std::runtime_error(
+          "runner stopped before structured output completed");
     impl_->stopped = true;
     return selection;
   }
@@ -952,6 +1101,10 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
     impl_->sampler.Accept(selection.token);
     impl_->generated.push_back(selection.token);
   }
+  if (step.stop && impl_->sampler.has_constraint() &&
+      !impl_->sampler.constraint_complete())
+    throw std::runtime_error(
+        "runner stopped before structured output completed");
   impl_->stopped = step.stop;
   impl_->state_reusable = true;
   return step;
@@ -993,7 +1146,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   checkpoint.resize(position);
   if (capabilities.snapshot && capabilities.fork) {
     CommitMetrics metrics = impl_->snapshot_metrics;
-    metrics.snapshot_bytes = impl_->lease.Commit(
+    metrics.snapshot_bytes += impl_->lease.Commit(
         std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
         std::move(checkpoint));
     impl_.reset();
@@ -1046,7 +1199,7 @@ TextRunnerPool::Request::Cancel() noexcept {
     }
     CommitMetrics metrics = impl_->snapshot_metrics;
     if (capabilities.snapshot && capabilities.fork) {
-      metrics.snapshot_bytes = impl_->lease.Commit(
+      metrics.snapshot_bytes += impl_->lease.Commit(
           std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
           std::move(checkpoint));
     } else {
@@ -1062,8 +1215,7 @@ TextRunnerPool::Request::Cancel() noexcept {
 
 void TextRunnerPool::Request::Invalidate() noexcept {
   if (impl_ != nullptr) {
-    if (impl_->snapshot_future.valid())
-      impl_->snapshot_future.wait();
+    impl_->DiscardCapture();
     dynamic_cast<TextRunnerState&>(impl_->lease.state())
         .SetCancellationCheck({});
     impl_->lease.Invalidate();
@@ -1085,6 +1237,10 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
 
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->cache.capacity();
+}
+
+std::vector<SlotLineage> TextRunnerPool::FreeSlotLineages() const {
+  return impl_->cache.FreeSlotLineages();
 }
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(
@@ -1250,6 +1406,12 @@ std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
       request.sampler.Accept(selection.token);
       request.generated.push_back(selection.token);
     }
+    if (step.stop && request.sampler.has_constraint() &&
+        !request.sampler.constraint_complete()) {
+      step.failure = std::make_exception_ptr(std::runtime_error(
+          "runner stopped before structured output completed"));
+      continue;
+    }
     request.stopped = step.stop;
     request.state_reusable = true;
   }
@@ -1261,8 +1423,17 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens) {
+    std::size_t cache_prefix_tokens,
+    std::shared_ptr<const sampling::TokenConstraint> json_constraint,
+    std::vector<TextCacheBoundary> cache_boundaries) {
   sampling_config.Validate();
+  if (json_constraint && sampling_config.temperature != 0)
+    throw std::invalid_argument(
+        "JSON constrained decoding requires temperature 0");
+  if (json_constraint &&
+      !impl_->validated.descriptor.capabilities.json_constraints)
+    throw std::invalid_argument(
+        "model does not support JSON constrained decoding");
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
   }
@@ -1271,6 +1442,11 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   }
   if (cache_prefix_tokens > prompt.size())
     throw std::invalid_argument("cache prefix exceeds prompt length");
+  if (cache_boundaries.size() > 4 ||
+      std::ranges::any_of(cache_boundaries, [&](const auto& boundary) {
+        return boundary.token_count > prompt.size();
+      }))
+    throw std::invalid_argument("invalid prepared cache boundaries");
 
   std::unique_lock admission(impl_->admission_mutex, std::defer_lock);
   while (!admission.try_lock_for(std::chrono::milliseconds(10))) {
@@ -1286,6 +1462,23 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   // checkpoint that also survives interrupted or reformatted assistant turns.
   const auto reusable = std::span<const TextRunnerToken>(prompt).first(
       cache_prefix_tokens == 0 ? prompt.size() : cache_prefix_tokens);
+  const auto alignment =
+      impl_->validated.descriptor.capabilities.prefix_checkpoint_alignment;
+  std::vector<std::size_t> learned;
+  if (reuse_prompt && alignment != 0 &&
+      impl_->validated.descriptor.capabilities.prefix_reuse &&
+      impl_->validated.descriptor.capabilities.snapshot &&
+      impl_->validated.descriptor.capabilities.fork)
+    learned = impl_->cache.LearnPrefixBoundaries(reusable, identity, alignment);
+  std::size_t disk_prefix = 0;
+  if (reuse_prompt && impl_->disk_store) {
+    try {
+      disk_prefix = impl_->disk_store->LongestPrefixTokens(
+          *impl_->validated.runner, reusable, identity);
+    } catch (...) {
+      // Optional disk metadata cannot prevent a RAM hit.
+    }
+  }
   auto lease = impl_->cache.Acquire(
       reusable, is_cancelled, identity,
       [&](ContinuationState& state) {
@@ -1293,7 +1486,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         text_state.SetCancellationCheck(is_cancelled);
         impl_->validated.runner->SetPromptContext(text_state, context);
       },
-      reuse_prompt);
+      reuse_prompt, disk_prefix);
   if (!lease) {
     return {};
   }
@@ -1315,10 +1508,14 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       try {
         if (runner.CheckpointPosition(state) != prefix.size())
           throw std::logic_error("live checkpoint position mismatch");
-        bytes = runner.SnapshotPayloadBytes(state);
+        const auto logical_bytes = runner.SnapshotPayloadBytes(state);
+        // The RAM reservation charges only the bytes not already retained
+        // from the session's pinned parent; the cache re-deduplicates at
+        // commit and fails closed if the true delta exceeds this estimate.
+        bytes = runner.SnapshotIncrementalBytes(state);
         if (lease.TryReserveSnapshot(bytes, prefix.size(), true)) {
           snapshot = runner.Snapshot(state);
-          if (snapshot == nullptr)
+          if (snapshot == nullptr || snapshot->PayloadBytes() != logical_bytes)
             throw std::runtime_error("live checkpoint capture failed");
           if (lease.PublishSnapshot({prefix.begin(), prefix.end()}, snapshot) ==
               0)
@@ -1374,6 +1571,22 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       impl_->validated.runner->SetPromptContext(state, context);
     }
   }
+  if (disk_prefix != 0 && !lease.cache_hit() &&
+      !(is_cancelled && is_cancelled())) {
+    // A metadata candidate can disappear, be busy or fail its payload check.
+    // Reacquire the shorter viable RAM fallback instead of reporting it lost.
+    lease.Invalidate();
+    lease = impl_->cache.Acquire(
+        reusable, is_cancelled, identity,
+        [&](ContinuationState& state) {
+          auto& text_state = dynamic_cast<TextRunnerState&>(state);
+          text_state.SetCancellationCheck(is_cancelled);
+          impl_->validated.runner->SetPromptContext(text_state, context);
+        },
+        reuse_prompt);
+    if (!lease)
+      return {};
+  }
   std::vector<std::size_t> boundaries;
   if (reuse_prompt && impl_->disk_store != nullptr &&
       !(is_cancelled && is_cancelled())) {
@@ -1388,10 +1601,69 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       return boundary <= lease.cached_tokens();
     });
   }
+  std::optional<TextCacheBoundary> early;
+  if (reuse_prompt && alignment != 0 &&
+      impl_->validated.descriptor.capabilities.snapshot &&
+      impl_->validated.descriptor.capabilities.fork) {
+    const auto consider = [&](TextCacheBoundary boundary) {
+      if (boundary.kind == TextCacheBoundaryKind::kFullPrompt ||
+          boundary.token_count <= lease.cached_tokens())
+        return;
+      boundary.token_count = lease.cached_tokens() +
+                             (boundary.token_count - lease.cached_tokens()) /
+                                 alignment * alignment;
+      if (boundary.token_count >= reusable.size() ||
+          boundary.token_count - lease.cached_tokens() < alignment ||
+          lease.HasSnapshotFor(reusable.first(boundary.token_count)))
+        return;
+      const auto rank = [](TextCacheBoundaryKind kind) {
+        switch (kind) {
+          case TextCacheBoundaryKind::kLearnedPrefix:
+            return 4;
+          case TextCacheBoundaryKind::kLastUserStart:
+            return 3;
+          case TextCacheBoundaryKind::kSystemEnd:
+            return 2;
+          case TextCacheBoundaryKind::kHistoryEnd:
+            return 1;
+          case TextCacheBoundaryKind::kFullPrompt:
+            return 0;
+        }
+        return 0;
+      };
+      if (!early || rank(boundary.kind) > rank(early->kind) ||
+          (rank(boundary.kind) == rank(early->kind) &&
+           boundary.token_count > early->token_count))
+        early = boundary;
+    };
+    for (const auto& boundary : cache_boundaries)
+      consider(boundary);
+    for (const auto count : learned)
+      consider({TextCacheBoundaryKind::kLearnedPrefix, count});
+  }
+  if (alignment != 0) {
+    // Disk metadata can train the same single, naturally reached RAM tap.
+    // Never retain the old multi-boundary shape-changing path for this policy.
+    if (!early) {
+      for (const auto count : boundaries) {
+        if (count <= lease.cached_tokens())
+          continue;
+        const auto position =
+            lease.cached_tokens() +
+            (count - lease.cached_tokens()) / alignment * alignment;
+        if (position < reusable.size() &&
+            position - lease.cached_tokens() >= alignment &&
+            (!early || position > early->token_count))
+          early = TextCacheBoundary{TextCacheBoundaryKind::kLearnedPrefix,
+                                    position};
+      }
+    }
+    boundaries.clear();
+  }
   return Request(std::make_unique<Request::Impl>(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
-      std::move(prompt), std::move(boundaries), sampling_config,
-      std::move(context), cache_prefix_tokens));
+      std::move(prompt), std::move(boundaries), early, sampling_config,
+      std::move(context), cache_prefix_tokens, std::move(json_constraint)));
 }
 
 TextRunnerPool::Request TextRunnerPool::Acquire(

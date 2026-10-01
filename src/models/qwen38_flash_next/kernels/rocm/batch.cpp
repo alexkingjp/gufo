@@ -189,6 +189,12 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         item.session->mtp_.position + n > item.session->max_context_) {
       return Fail(error, "invalid MTP body request");
     }
+    if (!EnsureHistoryCapacity(
+            *item.session,
+            item.session->mtp_.position + static_cast<std::uint32_t>(n),
+            error)) {
+      return false;
+    }
     for (std::size_t j = 0; j < i; ++j) {
       if (items[j].session == item.session)
         return Fail(error, "MTP body requests must be independent");
@@ -312,12 +318,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         continue;
       }
       ++session.mutation_epoch_;
-      Session::AttentionState attention;
-      attention.rope = session.vision_input_.rope();
-      attention.k_cache = session.mtp_.k_cache;
-      attention.v_cache = session.mtp_.v_cache;
-      attention.index_k = session.mtp_.index_k;
-      attention.block_k = session.mtp_.block_k;
+      Session::AttentionState attention = session.MtpAttentionView();
       const bool sparse = session.mtp_.position + n > c.indexer_top_k;
       const auto complete = (session.mtp_.position + n) / c.compress_ratio;
       const auto pool = sparse ? complete - session.mtp_.blocks : 0;
@@ -676,6 +677,13 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
             item.session->max_context_) {
       return Fail(error, "invalid session or chain in decode batch");
     }
+    if (!EnsureHistoryCapacity(
+            *item.session,
+            item.session->position_ +
+                static_cast<std::uint32_t>(item.tokens.size()),
+            error)) {
+      return false;
+    }
     for (std::size_t j = 0; j < i; ++j) {
       if (items[j].session == item.session) {
         return Fail(error, "decode batch contains a duplicate session");
@@ -973,8 +981,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
 
 bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
                                  float* logits, std::string* error) const {
-  if (rows == 0 || rows > options_.max_logit_rows || offset > batch_rows_ ||
-      rows > batch_rows_ - offset) {
+  if (rows == 0 || offset > batch_rows_ || rows > batch_rows_ - offset) {
     return Fail(error, "logit rows outside the completed decode batch");
   }
   const std::size_t count =

@@ -9,6 +9,42 @@ llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP.
 Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
 
+## Local serving research, September 24-25
+
+The local `research/halogen-parity-20260924` branch was compared with upstream
+`9cad139` on the same 128 GB Strix Halo host, GCC 15.3/ROCm 7.2.3, identical
+Unsloth weights, one 262144-capacity GPU session, greedy/thinking-off requests,
+and unchanged background embeddings service. Unique system prefixes prevented
+cache hits in cold-prefill fixtures. All 33 final payload hashes, prompt counts,
+and visible outputs matched the upstream Gufo run.
+
+| Workload | Upstream | Research branch |
+| --- | ---: | ---: |
+| 8K fresh prompt, full one-token request | 6.37 s | 5.69 s |
+| 32K fresh prompt, full one-token request | 26.00 s | 23.83 s |
+| 128K fresh prompt, full one-token request | 109.17 s | 101.70 s |
+| 32K generation snapshot capture | 1.42 s | 0.14 s |
+| 128K snapshot capture | 5.51 s | 0.35 s |
+| Short mixed generation, aggregate decode | 41.83 tok/s | 42.50 tok/s |
+| 32K generation, aggregate decode | 40.26 tok/s | 40.40 tok/s |
+| Interleaved 32K conversation first-token latency | 24.29-24.41 s | 0.17-0.19 s |
+
+Prefill: three 8K/32K repetitions, two 128K repetitions, one generated token.
+Generation: ten published prompt shapes twice, 512-token cap; three additional
+32K-context shapes. Aggregate decode divides total generated tokens by summed
+engine decode seconds. Snapshot time is outside that decode timer and included
+in full request latency. Interleaved caching uses three conversations and actual
+returned assistant history. These are bounded local measurements, not confidence
+intervals; the small decode change at 32K is not a robust speed claim.
+
+A second retained-controller run measured 43.55/41.37 tok/s for short/32K decode,
+showing run variability. Halogen 0.13.4 on this host measured 45.44/45.99 tok/s
+with different HGN weights and four shared-pool slots. The research branch does
+not establish full Halogen decode or API parity. The largest repeatable gains
+are snapshot allocation and cache retention, not changed kernel arithmetic.
+Raw local evidence is recorded in `artifacts/local-serving-research.json`;
+full traces and outputs remain in the operator's local research directory.
+
 ## Single user, autoregressive
 
 Approximately pp2048 / tg128; depth is the cached prefix in tokens.

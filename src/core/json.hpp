@@ -40,6 +40,21 @@ public:
   Value(std::nullptr_t) {}
   Value(bool v) : type_(Type::kBool), bool_(v) {}
   Value(double v) : type_(Type::kNumber), num_(v) {}
+  static Value parsed_number(double value, std::string_view spelling) {
+    Value result(value);
+    char buffer[64];
+    const auto [end, error] =
+        std::to_chars(buffer, buffer + sizeof(buffer), value);
+    result.number_exact_ = error == std::errc{} &&
+                           canonical_decimal(spelling) ==
+                               canonical_decimal(std::string_view(buffer, end));
+    if (!result.number_exact_)
+      result.number_spelling_ = std::string(spelling);
+    return result;
+  }
+  [[nodiscard]] bool number_is_exact() const noexcept {
+    return is_number() && number_exact_;
+  }
   Value(int v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Value(long v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Value(long long v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
@@ -179,6 +194,52 @@ public:
   }
 
 private:
+  static std::string canonical_decimal(std::string_view input) {
+    bool negative = !input.empty() && input.front() == '-';
+    if (negative)
+      input.remove_prefix(1);
+    const auto exponent_at = input.find_first_of("eE");
+    auto mantissa = input.substr(0, exponent_at);
+    long long exponent = 0;
+    if (exponent_at != std::string_view::npos) {
+      auto part = input.substr(exponent_at + 1);
+      bool exponent_negative = !part.empty() && part.front() == '-';
+      if (!part.empty() && (part.front() == '-' || part.front() == '+'))
+        part.remove_prefix(1);
+      while (part.size() > 1 && part.front() == '0')
+        part.remove_prefix(1);
+      if (part.size() > 9)
+        return "invalid-exponent";
+      const auto [end, error] =
+          std::from_chars(part.data(), part.data() + part.size(), exponent);
+      if (error != std::errc{} || end != part.data() + part.size())
+        return "invalid-exponent";
+      if (exponent_negative)
+        exponent = -exponent;
+    }
+    std::string digits;
+    digits.reserve(mantissa.size());
+    bool after_point = false;
+    for (char c : mantissa) {
+      if (c == '.')
+        after_point = true;
+      else {
+        digits += c;
+        if (after_point)
+          --exponent;
+      }
+    }
+    const auto first = digits.find_first_not_of('0');
+    if (first == std::string::npos)
+      return "0";
+    digits.erase(0, first);
+    while (digits.size() > 1 && digits.back() == '0') {
+      digits.pop_back();
+      ++exponent;
+    }
+    return (negative ? "-" : "") + digits + "e" + std::to_string(exponent);
+  }
+
   // NOLINTNEXTLINE(misc-no-recursion)
   void dump_to(std::ostream& os) const {
     switch (type_) {
@@ -191,6 +252,10 @@ private:
       case Type::kNumber: {
         if (!std::isfinite(num_)) {
           throw std::invalid_argument("JSON numbers must be finite");
+        }
+        if (!number_spelling_.empty()) {
+          os << number_spelling_;
+          break;
         }
         char buffer[64];
         const auto [end, error] =
@@ -270,6 +335,8 @@ private:
   Type type_ = Type::kNull;
   bool bool_ = false;
   double num_ = 0.0;
+  bool number_exact_ = true;
+  std::string number_spelling_;
   std::string str_;
   Array arr_;
   Object obj_;
@@ -549,7 +616,7 @@ struct Parser {
         !std::isfinite(value)) {
       fail("bad number");
     }
-    return Value(value);
+    return Value::parsed_number(value, tok);
   }
 };
 }  // namespace detail

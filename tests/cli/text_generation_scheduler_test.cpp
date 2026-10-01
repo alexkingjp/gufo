@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
@@ -20,6 +21,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "src/cli/serve/generation_metrics.hpp"
 
 namespace {
 
@@ -64,6 +67,16 @@ struct Event {
   TextRunnerToken label;
   std::size_t index;
   std::size_t count;
+  double start_ms{0};
+};
+
+struct FakeClock {
+  TextGenerationScheduler::Clock::time_point Now() const {
+    return TextGenerationScheduler::Clock::time_point{
+        std::chrono::milliseconds{milliseconds.load()}};
+  }
+  void Advance(std::int64_t ms) { milliseconds.fetch_add(ms); }
+  std::atomic<std::int64_t> milliseconds{0};
 };
 
 struct FakeControl {
@@ -156,8 +169,15 @@ struct FakeControl {
   bool batched_multi_token_decode{false};
   std::size_t actual_batch_width{4};
   bool prefix_reuse{true};
+  bool json_constraints{false};
   bool preview_first_token{false};
+  std::size_t prefix_checkpoint_alignment{0};
   std::function<void()> snapshot_callback;
+  std::shared_ptr<FakeClock> clock;
+  std::int64_t prefill_token_ms{0};
+  std::int64_t advance_ms{0};
+  std::int64_t restore_ms{0};
+  std::function<void(TextRunnerToken)> after_advance;
 };
 
 class FakeState final : public TextRunnerState {
@@ -205,7 +225,7 @@ public:
     return {
         .model_id = "scheduler-fake",
         .state_abi = "scheduler-fake-v1",
-        .max_context = 128,
+        .max_context = 4096,
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = control_->incremental_prefill,
@@ -220,9 +240,20 @@ public:
                     control_->batched_multi_token_decode,
                 .batched_multi_token_decode_max_width = 4,
                 .prefix_reuse = control_->prefix_reuse,
+                .json_constraints = control_->json_constraints,
+                .prefix_checkpoint_alignment =
+                    control_->prefix_checkpoint_alignment,
             },
         .persistence = std::nullopt,
     };
+  }
+
+  void SetPromptContext(
+      TextRunnerState&,
+      std::shared_ptr<const gufo::server::TextPromptContext> context)
+      const override {
+    // The fake accepts any context; identity matching happens in the cache.
+    (void)context;
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
@@ -278,6 +309,21 @@ public:
     return text;
   }
 
+  [[nodiscard]] std::shared_ptr<const gufo::sampling::TokenConstraint>
+  CreateJsonConstraint(
+      std::shared_ptr<const gufo::JsonConstraint> prototype,
+      gufo::sampling::TokenConstraint::Options options = {}) const override {
+    if (!control_->json_constraints)
+      return TextModelRunner::CreateJsonConstraint(std::move(prototype),
+                                                   options);
+    using Constraint = gufo::sampling::TokenConstraint;
+    return std::make_shared<const Constraint>(
+        std::move(prototype),
+        std::make_shared<const Constraint::Vocabulary>(Constraint::Vocabulary{
+            {"bad"}, {"{"}, {"}"}, {"\"x\":"}, {"1"}, {"", true, true}}),
+        options);
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     control_->states_created.fetch_add(1, std::memory_order_relaxed);
     return std::make_unique<FakeState>(control_);
@@ -306,6 +352,10 @@ public:
           .label = fake.label,
           .index = fake.position,
           .count = consumed,
+          .start_ms =
+              control_->clock
+                  ? static_cast<double>(control_->clock->milliseconds.load())
+                  : 0.0,
       });
       if (control_->block_prefill_label == fake.label &&
           !control_->prefill_gate_entered) {
@@ -320,6 +370,8 @@ public:
       }
     }
 
+    if (control_->clock)
+      control_->clock->Advance(control_->prefill_token_ms * consumed);
     fake.position += consumed;
     const bool ready = fake.position == prompt.size();
     if (ready) {
@@ -332,8 +384,18 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
-    const auto& fake = RequireFakeState(state);
+      TextRunnerState& state,
+      gufo::sampling::SamplerState& sampler) const override {
+    auto& fake = RequireFakeState(state);
+    if (sampler.has_constraint()) {
+      const std::vector<float> logits{100, 8, 7, 6, 5, 99};
+      const auto token = sampler.Sample(logits);
+      if (token == 5)
+        return {.stop = true, .piece = {}};
+      fake.frontier = token;
+      const std::vector<std::string> pieces{"bad", "{", "}", "\"x\":", "1"};
+      return {.token = token, .piece = pieces[token]};
+    }
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
     }
@@ -383,6 +445,8 @@ public:
     restored.position = saved.position;
     restored.decode_count = saved.decode_count;
     restored.frontier = saved.frontier;
+    if (control_->clock)
+      control_->clock->Advance(control_->restore_ms);
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -413,12 +477,20 @@ public:
           .label = fake.label,
           .index = fake.decode_count,
           .count = 1,
+          .start_ms =
+              control_->clock
+                  ? static_cast<double>(control_->clock->milliseconds.load())
+                  : 0.0,
       });
     }
 
     ++fake.position;
     ++fake.decode_count;
     fake.frontier = token + 1;
+    if (control_->clock)
+      control_->clock->Advance(control_->advance_ms);
+    if (control_->after_advance)
+      control_->after_advance(fake.label);
     if (fake.label == 1)
       control_->first_request_advance_ns.fetch_add(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -430,7 +502,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       gufo::sampling::SamplerState& sampler) const override {
-    if (!control_->multi_token_decode) {
+    if (sampler.has_constraint() || !control_->multi_token_decode) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     auto& fake = RequireFakeState(state);
@@ -496,7 +568,10 @@ std::unique_ptr<TextGenerationScheduler> MakeScheduler(
   auto runner = std::make_shared<FakeRunner>(control);
   auto pool = std::make_shared<TextRunnerPool>(std::move(runner), capacity);
   return std::make_unique<TextGenerationScheduler>(
-      std::move(pool), prefill_policy, scheduler_policy);
+      std::move(pool), prefill_policy, scheduler_policy,
+      [clock = control->clock] {
+        return clock ? clock->Now() : TextGenerationScheduler::Clock::now();
+      });
 }
 
 std::size_t EventIndex(std::span<const Event> events, EventKind kind,
@@ -628,6 +703,56 @@ void TestMultiTokenRunnerCanSwitchToBatchedExecution() {
          "target batching bypasses per-request draft steps");
   Expect(control->batch_preparations.load(std::memory_order_relaxed) >= 2,
          "both resident states are prepared before target batching");
+}
+
+void TestStickyAdmissionPrefersResidentLineage() {
+  auto control = std::make_shared<FakeControl>();
+  control->snapshot_callback = [] {};
+  control->prefix_reuse = true;
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 1);
+
+  auto lineage = std::make_shared<gufo::server::TextPromptContext>();
+  lineage->cache_identity = {0xAA};
+  auto other = std::make_shared<gufo::server::TextPromptContext>();
+  other->cache_identity = {0xBB};
+
+  // The resident turn seeds slot 0 with lineage 0xAA.
+  auto resident = scheduler->Submit(
+      {1, 10}, 4, 0.0F, {}, false,
+      TextRequestMetadata{.client_id = "a",
+                          .request_start = TextGenerationScheduler::Clock::now(),
+                          .prompt_context = lineage});
+  control->WaitForPrefill(1);
+
+  // Two queued turns while the slot is busy: an unrelated client and the
+  // resident lineage's own follow-up. Sticky admission must hand the freed
+  // slot back to the follow-up so it serves its live state in place.
+  auto unrelated = scheduler->Submit(
+      {2, 20}, 4, 0.0F, {}, false,
+      TextRequestMetadata{.client_id = "b",
+                          .request_start = TextGenerationScheduler::Clock::now(),
+                          .prompt_context = other});
+  auto follow_up = scheduler->Submit(
+      {1, 10, 11}, 4, 0.0F, {}, false,
+      TextRequestMetadata{.client_id = "a",
+                          .request_start = TextGenerationScheduler::Clock::now(),
+                          .prompt_context = lineage});
+  control->ReleasePrefill();
+
+  const auto result_resident = resident.Wait();
+  const auto result_follow_up = follow_up.Wait();
+  const auto result_unrelated = unrelated.Wait();
+  Expect(!result_resident.tokens.empty() && !result_follow_up.tokens.empty() &&
+             !result_unrelated.tokens.empty(),
+         "all three queued turns complete");
+  const auto prefill_follow_up =
+      EventIndex(control->events, EventKind::kPrefill, 1, 1);
+  const auto prefill_unrelated =
+      EventIndex(control->events, EventKind::kPrefill, 2, 0);
+  Expect(prefill_follow_up < prefill_unrelated,
+         "sticky admission admits the resident lineage before the unrelated "
+         "head");
 }
 
 void TestBatchFailureIsolation() {
@@ -1363,7 +1488,715 @@ void TestShutdownCancelsRunnerAcquisition() {
   stopped.get();
 }
 
+void TestJsonMetadataAndConcurrentCursors() {
+  for (const bool multi : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->json_constraints = true;
+    control->multi_token_decode = multi;
+    control->batched_multi_token_decode = multi;
+    control->supports_batched_advance = true;
+    control->incremental_text_is_exact = true;
+    control->preview_first_token = true;
+    control->snapshot_callback = [] {};
+    control->block_prefill_label = 1;
+    auto scheduler = MakeScheduler(control, 4);
+    const auto prototype = std::make_shared<const gufo::JsonConstraint>(
+        gufo::JsonConstraint::Compile(R"({"const":{}})"));
+    TextRequestMetadata empty;
+    empty.json_constraint = scheduler->runner().CreateJsonConstraint(prototype);
+    TextRequestMetadata value;
+    value.json_constraint = scheduler->runner().CreateJsonConstraint(
+        std::make_shared<const gufo::JsonConstraint>(
+            gufo::JsonConstraint::Compile(R"({"const":{"x":1}})")));
+    auto first = scheduler->Submit({1, 10}, 12, 0.0F, {}, true, empty);
+    control->WaitForPrefill(1);
+    auto second = scheduler->Submit({2, 20}, 12, 0.0F, {}, false, value);
+    auto third = scheduler->Submit({3, 30}, 12, 0.0F, {}, false, empty);
+    auto plain = scheduler->Submit({4, 40}, 4, 0.0F);
+    control->ReleasePrefill();
+    std::string streamed;
+    const auto a = first.Wait([&](std::string_view piece) {
+      streamed += piece;
+      return true;
+    });
+    const auto b = second.Wait();
+    const auto c = third.Wait();
+    const auto d = plain.Wait();
+    Expect(a.text == "{}" && streamed == a.text && b.text == "{\"x\":1}" &&
+               c.text == "{}",
+           "streamed and buffered metadata retain independent grammar cursors");
+    Expect(a.finish_reason ==
+                   gufo::server::TextGenerationBackend::FinishReason::kStop &&
+               b.finish_reason == a.finish_reason &&
+               c.finish_reason == a.finish_reason,
+           "constrained requests stop only at completed grammar");
+    Expect(a.draft_tokens == 0 && b.draft_tokens == 0 && c.draft_tokens == 0,
+           "mixed batch constrained rows never use draft generation");
+    Expect(d.tokens == ExpectedTokens(4, 4),
+           "unconstrained trajectory remains unchanged");
+    const auto cached =
+        scheduler->Submit({1, 10}, 12, 0.0F, {}, false, empty).Wait();
+    Expect(cached.cache_hit && cached.text == "{}" && prototype->Allows("{}"),
+           "cache reuse starts a fresh grammar, including first-token preview");
+  }
+}
+
+void TestJsonAdmissionRejectsBeforeInference() {
+  auto control = std::make_shared<FakeControl>();
+  control->json_constraints = true;
+  auto scheduler = MakeScheduler(control, 1);
+  TextRequestMetadata metadata;
+  metadata.json_constraint = scheduler->runner().CreateJsonConstraint(
+      std::make_shared<const gufo::JsonConstraint>(
+          gufo::JsonConstraint::JsonObject()));
+  bool rejected = false;
+  try {
+    (void)scheduler->Submit({1}, 4, {.temperature = 1, .top_k = 1}, {}, false,
+                            metadata);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  Expect(
+      rejected && control->Events().empty(),
+      "sampled JSON is rejected before queued inference even with top-k one");
+  auto unsupported = std::make_shared<FakeControl>();
+  auto other = MakeScheduler(unsupported, 1);
+  rejected = false;
+  try {
+    (void)other->Submit({1}, 4, 0.0F, {}, false, metadata);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  Expect(rejected && unsupported->Events().empty(),
+         "unsupported runner rejects constraint before inference");
+}
+
+TextRequestMetadata TimedMetadata(const std::shared_ptr<FakeControl>& control,
+                                  std::string client = "anonymous",
+                                  std::optional<std::size_t> estimate = {}) {
+  auto metadata = ClientMetadata(std::move(client));
+  metadata.request_start = control->clock->Now();
+  metadata.estimated_prefill_tokens = estimate;
+  return metadata;
+}
+
+void ExpectMilliseconds(double actual, double expected,
+                        std::string_view label) {
+  Expect(std::abs(actual - expected) < 1e-6, label);
+}
+
+void TestCandidatePoliciesAreOptInAndValidated() {
+  const TextSchedulerPolicy policy;
+  const TextPrefillPolicy prefill;
+  Expect(policy.decode_burst.count() == 0 &&
+             policy.queue_timeout.count() == 0 &&
+             policy.max_inflight_requests_per_client == 0 &&
+             policy.max_inflight_prefill_tokens == 0 &&
+             !policy.prefer_short_prefill && !prefill.adaptive_chunking &&
+             prefill.decode_active_tokens == 512,
+         "unqualified policies do not silently change production defaults");
+  for (int invalid = 0; invalid != 7; ++invalid) {
+    auto control = std::make_shared<FakeControl>();
+    auto p = policy;
+    auto f = prefill;
+    if (invalid == 0)
+      p.decode_burst = std::chrono::milliseconds{-1};
+    if (invalid == 1)
+      p.queue_timeout = std::chrono::milliseconds{-1};
+    if (invalid == 2)
+      p.max_decode_steps_per_burst = 0;
+    if (invalid == 3)
+      p.admission_aging = std::chrono::milliseconds{-1};
+    if (invalid == 4)
+      f.target_chunk_time = std::chrono::milliseconds{0};
+    if (invalid == 5)
+      f.min_chunk_tokens = 0;
+    if (invalid == 6)
+      f.min_chunk_tokens = 513;
+    bool rejected = false;
+    try {
+      (void)MakeScheduler(control, 2, f, p);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Expect(rejected, "invalid bounded latency policy is rejected");
+  }
+}
+
+void TestSustainedColdPrefillAndWarmDecode() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->advance_ms = 20;
+  control->prefill_token_ms = 10;
+  control->block_advance_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 2, {.decode_active_tokens = 2},
+                    {.decode_burst = std::chrono::milliseconds{100}});
+  auto warm =
+      scheduler->Submit({1}, 100, 0.0F, {}, false, TimedMetadata(control));
+  control->WaitForAdvance(1);
+  auto first = scheduler->Submit(std::vector<TextRunnerToken>(8, 2), 2, 0.0F,
+                                 {}, false, TimedMetadata(control, "first"));
+  auto second = scheduler->Submit(std::vector<TextRunnerToken>(8, 3), 2, 0.0F,
+                                  {}, false, TimedMetadata(control, "second"));
+  std::optional<TextGenerationScheduler::Request> later;
+  std::size_t warm_steps = 0;
+  control->after_advance = [&](TextRunnerToken label) {
+    if (label == 1 && ++warm_steps == 12)
+      later.emplace(scheduler->Submit(std::vector<TextRunnerToken>(8, 4), 2,
+                                      0.0F, {}, false,
+                                      TimedMetadata(control, "later")));
+  };
+  control->ReleaseAdvance();
+  const auto warm_result = warm.Wait();
+  Expect(later.has_value(),
+         "fixture includes a later arrival, not only one burst");
+  for (const auto& result : {first.Wait(), second.Wait(), later->Wait()}) {
+    Expect(result.prefill_chunks == 4 && result.prefill_tokens == 8 &&
+               result.resident_requests_at_admission <= 2 &&
+               result.physical_execution_width == 1,
+           "sustained cold requests progress within two real resident slots");
+  }
+  const auto events = control->Events();
+  for (TextRunnerToken label : {2, 3, 4}) {
+    double previous = -1;
+    for (const auto& event : events) {
+      if (event.kind != EventKind::kPrefill || event.label != label)
+        continue;
+      if (previous >= 0)
+        Expect(event.start_ms - previous <= 160,
+               "100ms decode bursts still guarantee bounded prefill progress");
+      previous = event.start_ms;
+    }
+    Expect(EventIndex(events, EventKind::kPrefill, label, 3) <
+               EventIndex(events, EventKind::kAdvance, 1, 99),
+           "long prefill cannot starve behind an active warm decoder");
+  }
+  Expect(EventIndex(events, EventKind::kAdvance, 1, 4) <
+             EventIndex(events, EventKind::kPrefill, 2),
+         "decode gets measured work bursts rather than one step per chunk");
+  ExpectMilliseconds(warm_result.peer_prefill_ms, 240,
+                     "warm decoder reports all peer prefill pauses");
+  Expect(warm_result.resident_wait_ms >= warm_result.peer_prefill_ms &&
+             warm_result.decode_wall_ms > warm_result.decode_ms &&
+             warm_result.max_inter_token_ms <= 100,
+         "wall decode includes peer work while active decode does not");
+  Expect(gufo::server::DecodeWallTokensPerSecond(warm_result) <
+             gufo::server::ActiveDecodeTokensPerSecond(warm_result),
+         "active-work TPS cannot masquerade as user-observed throughput");
+}
+
+void TestCachedReplacementsCannotStarvePrefill() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->advance_ms = 20;
+  control->prefill_token_ms = 5;
+  control->block_advance_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 2, {.decode_active_tokens = 2},
+                    {.decode_burst = std::chrono::milliseconds{100}});
+  auto warm =
+      scheduler->Submit({1}, 1, 0.0F, {}, false, TimedMetadata(control));
+  control->WaitForAdvance(1);
+  auto cold = scheduler->Submit(std::vector<TextRunnerToken>(6, 2), 1, 0.0F, {},
+                                false, TimedMetadata(control, "cold"));
+  std::vector<TextGenerationScheduler::Request> replacements;
+  std::vector<TextRunnerToken> prefix{1};
+  std::size_t generated = 0;
+  std::binary_semaphore arrived(0);
+  control->after_advance = [&](TextRunnerToken label) {
+    if (label != 1)
+      return;
+    prefix.push_back(100 + static_cast<TextRunnerToken>(generated++));
+    if (generated < 30)
+      replacements.push_back(scheduler->Submit(prefix, 1, 0.0F, {}, false,
+                                               TimedMetadata(control, "warm")));
+    else
+      arrived.release();
+  };
+  control->ReleaseAdvance();
+  (void)warm.Wait();
+  Expect(arrived.try_acquire_for(kTestTimeout),
+         "bounded warm replacement sequence completes");
+  for (auto& request : replacements)
+    Expect(request.Wait().cache_hit,
+           "replacement fixture uses genuinely ready cache frontiers");
+  Expect(cold.Wait().prefill_chunks == 3,
+         "cold prefill progresses despite warm turnover");
+  const auto events = control->Events();
+  Expect(EventIndex(events, EventKind::kPrefill, 2) <
+             EventIndex(events, EventKind::kAdvance, 1, 6),
+         "new decode-ready admissions cannot repeatedly extend an exhausted "
+         "burst");
+  Expect(EventIndex(events, EventKind::kPrefill, 2, 2) <
+             EventIndex(events, EventKind::kAdvance, 1, 20),
+         "sustained warm replacement leaves a bounded prefill share");
+}
+
+void TestZeroCostDecodeBurstStillYields() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->block_advance_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 2, {.decode_active_tokens = 2},
+                    {.decode_burst = std::chrono::milliseconds{100},
+                     .max_decode_steps_per_burst = 3});
+  auto warm =
+      scheduler->Submit({1}, 30, 0.0F, {}, false, TimedMetadata(control));
+  control->WaitForAdvance(1);
+  auto cold = scheduler->Submit({2, 20, 21, 22, 23, 24}, 1, 0.0F, {}, false,
+                                TimedMetadata(control));
+  control->ReleaseAdvance();
+  (void)warm.Wait();
+  Expect(cold.Wait().prefill_chunks == 3, "step cap preserves cold progress");
+  const auto events = control->Events();
+  const auto first = EventIndex(events, EventKind::kPrefill, 2);
+  Expect(EventIndex(events, EventKind::kAdvance, 1, 2) < first &&
+             first < EventIndex(events, EventKind::kAdvance, 1, 4),
+         "a zero-cost runner yields at the bounded decode step count");
+}
+
+void TestMeasuredPrefillBudgetAndGeometryFallback() {
+  for (const bool adaptive : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->clock = std::make_shared<FakeClock>();
+    control->prefill_capacity = 2048;
+    control->prefill_token_ms = 1;
+    control->advance_ms = 20;
+    control->block_advance_label = 1;
+    auto scheduler = MakeScheduler(
+        control, 2, {.min_chunk_tokens = 16, .adaptive_chunking = adaptive},
+        {.decode_burst = std::chrono::milliseconds{100}});
+    auto warm =
+        scheduler->Submit({1}, 256, 0.0F, {}, false, TimedMetadata(control));
+    control->WaitForAdvance(1);
+    auto cold = scheduler->Submit(std::vector<TextRunnerToken>(2048, 2), 1,
+                                  0.0F, {}, false, TimedMetadata(control));
+    control->ReleaseAdvance();
+    (void)warm.Wait();
+    const auto result = cold.Wait();
+    Expect(result.prefill_tokens == 2048,
+           "adaptive chunking consumes every token");
+    Expect(result.max_prefill_chunk_tokens == (adaptive ? 100U : 512U),
+           "measured prefill uses 100ms estimate only when explicitly enabled");
+    ExpectMilliseconds(result.max_prefill_chunk_ms, adaptive ? 100 : 512,
+                       "chunk wall metric records actual measured work");
+  }
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 2, {.adaptive_chunking = true},
+                                 {.max_decode_steps_per_burst = 2});
+  auto warm =
+      scheduler->Submit({1}, 10, 0.0F, {}, false, TimedMetadata(control));
+  control->WaitForAdvance(1);
+  auto cold = scheduler->Submit(std::vector<TextRunnerToken>(1024, 2), 1, 0.0F,
+                                {}, false, TimedMetadata(control));
+  control->ReleaseAdvance();
+  (void)warm.Wait();
+  Expect(cold.Wait().max_prefill_chunk_tokens == 512,
+         "zero-time calibration falls back to existing 512-token geometry");
+}
+
+void TestAdaptivePrefillFloorAndMtpBurstOvershoot() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->prefill_token_ms = 50;
+  control->advance_ms = 25;
+  control->multi_token_decode = true;
+  control->block_advance_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 2,
+                    {.decode_active_tokens = 8,
+                     .min_chunk_tokens = 4,
+                     .adaptive_chunking = true},
+                    {.decode_burst = std::chrono::milliseconds{100}});
+  auto warm =
+      scheduler->Submit({1}, 90, 0.0F, {}, false, TimedMetadata(control));
+  control->WaitForAdvance(1);
+  auto cold = scheduler->Submit(std::vector<TextRunnerToken>(11, 2), 1, 0.0F,
+                                {}, false, TimedMetadata(control));
+  control->ReleaseAdvance();
+  (void)warm.Wait();
+  const auto result = cold.Wait();
+  Expect(result.prefill_chunks == 3 && result.max_prefill_chunk_tokens == 4,
+         "adaptive floor is honored, with a smaller final tail");
+  ExpectMilliseconds(
+      result.max_prefill_chunk_ms, 200,
+      "floor overshoot is observable, not a false 100ms guarantee");
+  const auto events = control->Events();
+  const auto first = EventIndex(events, EventKind::kPrefill, 2);
+  Expect(EventIndex(events, EventKind::kAdvance, 1, 5) < first &&
+             first < EventIndex(events, EventKind::kAdvance, 1, 6),
+         "MTP yields after indivisible steps cross 100ms, not one token at a "
+         "time");
+}
+
+void TestCancellationDuringDecodeRetainsWorkAndWallTiming() {
+  for (const bool multi : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->clock = std::make_shared<FakeClock>();
+    control->prefill_token_ms = 5;
+    control->advance_ms = 10;
+    control->multi_token_decode = multi;
+    control->block_advance_label = 1;
+    auto scheduler = MakeScheduler(control, 1);
+    auto request =
+        scheduler->Submit({1}, 9, 0.0F, {}, false, TimedMetadata(control));
+    control->WaitForAdvance(1);
+    request.Cancel();
+    control->ReleaseAdvance();
+    const auto result = request.Wait();
+    Expect(result.cancelled, "decode cancellation stays a separate outcome");
+    ExpectMilliseconds(result.decode_ms, multi ? 30 : 10,
+                       "cancellation retains already executed model work");
+    ExpectMilliseconds(result.total_generation_wall_ms, multi ? 35 : 15,
+                       "cancelled total includes prefill and executed decode");
+  }
+}
+
+void TestShortAdmissionHasBoundedBypassAndAging() {
+  for (const bool aged : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->clock = std::make_shared<FakeClock>();
+    control->block_advance_label = 1;
+    auto scheduler =
+        MakeScheduler(control, 1, {},
+                      {.prefer_short_prefill = true,
+                       .max_admission_bypasses = 2,
+                       .admission_aging = std::chrono::milliseconds{100}});
+    auto active =
+        scheduler->Submit({1}, 1, 0.0F, {}, false, TimedMetadata(control));
+    control->WaitForAdvance(1);
+    auto old = scheduler->Submit(std::vector<TextRunnerToken>(16, 2), 1, 0.0F,
+                                 {}, false, TimedMetadata(control, "old", 16));
+    if (aged)
+      control->clock->Advance(100);
+    std::vector<TextGenerationScheduler::Request> shorts;
+    for (TextRunnerToken label : {3, 4, 5})
+      shorts.push_back(
+          scheduler->Submit({label}, 1, 0.0F, {}, false,
+                            TimedMetadata(control, std::to_string(label), 1)));
+    control->ReleaseAdvance();
+    (void)active.Wait();
+    (void)old.Wait();
+    for (auto& request : shorts)
+      (void)request.Wait();
+    std::vector<TextRunnerToken> order;
+    for (const auto& event : control->Events())
+      if (event.kind == EventKind::kPrefill)
+        order.push_back(event.label);
+    Expect(
+        order == (aged ? std::vector<TextRunnerToken>{1, 2, 3, 4, 5}
+                       : std::vector<TextRunnerToken>{1, 3, 4, 2, 5}),
+        "old work runs after two bypasses or immediately at its aging bound");
+  }
+}
+
+void TestUnknownCacheEstimateIsNotColdHardRejection() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->block_advance_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 1, {}, {.max_inflight_prefill_tokens = 4});
+  auto active = scheduler->Submit({1}, 1, 0.0F, {}, false,
+                                  TimedMetadata(control, "active", 1));
+  control->WaitForAdvance(1);
+  auto unknown =
+      scheduler->Submit(std::vector<TextRunnerToken>(100, 2), 1, 0.0F, {},
+                        false, TimedMetadata(control, "unknown"));
+  auto known = scheduler->Submit({3, 3, 3}, 1, 0.0F, {}, false,
+                                 TimedMetadata(control, "known", 3));
+  bool rejected = false;
+  try {
+    (void)scheduler->Submit({4, 4}, 1, 0.0F, {}, false,
+                            TimedMetadata(control, "overflow", 2));
+  } catch (const TextGenerationError& error) {
+    rejected = error.code() == TextGenerationErrorCode::kPrefillBudgetFull &&
+               error.http_status() == 429 && error.retryable();
+  }
+  Expect(rejected,
+         "known outstanding prefill estimate is bounded before admission");
+  known.Cancel();
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  Expect(known.Wait().cancelled, "cancelled estimate releases reservation");
+  const auto result = unknown.Wait();
+  Expect(
+      !result.estimated_prefill_tokens &&
+          result.effective_prefill_tokens == 100,
+      "unknown eligibility remains unknown until safe actual cache admission");
+  const auto replacement = scheduler
+                               ->Submit({5, 5, 5, 5}, 1, 0.0F, {}, false,
+                                        TimedMetadata(control, "new", 4))
+                               .Wait();
+  Expect(replacement.prefill_tokens == 4,
+         "completed and cancelled work releases tokens");
+}
+
+void TestInflightClientLimitCountsResidentAndPending() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->block_advance_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 2, {}, {.max_inflight_requests_per_client = 2});
+  auto first =
+      scheduler->Submit({1}, 1, 0.0F, {}, false, TimedMetadata(control, "a"));
+  control->WaitForAdvance(1);
+  auto queued =
+      scheduler->Submit({2}, 1, 0.0F, {}, false, TimedMetadata(control, "a"));
+  bool rejected = false;
+  try {
+    (void)scheduler->Submit({3}, 1, 0.0F, {}, false,
+                            TimedMetadata(control, "a"));
+  } catch (const TextGenerationError& error) {
+    rejected = error.code() == TextGenerationErrorCode::kClientInflightFull;
+  }
+  auto other =
+      scheduler->Submit({4}, 1, 0.0F, {}, false, TimedMetadata(control, "b"));
+  queued.Cancel();
+  control->ReleaseAdvance();
+  (void)first.Wait();
+  const auto cancelled = queued.Wait();
+  const auto result = other.Wait();
+  Expect(rejected && cancelled.cancelled && result.completion_tokens == 1,
+         "client inflight cap cannot be evaded by acquiring a resident slot");
+  Expect(
+      cancelled.resident_requests_at_submit == 1 &&
+          cancelled.inflight_requests_at_submit == 2 &&
+          cancelled.client_inflight_requests_at_submit == 2 &&
+          result.inflight_requests_at_submit == 3 &&
+          result.queue_depth_at_submit == 2 &&
+          result.requested_logical_concurrency == 2 &&
+          result.physical_execution_width == 1,
+      "task backlog, resident slots and physical width are distinct metrics");
+  Expect(result.request_id != cancelled.request_id && cancelled.request_id != 0,
+         "requests have content-free correlation IDs");
+  (void)scheduler->Submit({5}, 1, 0.0F, {}, false, TimedMetadata(control, "a"))
+      .Wait();
+}
+
+void TestCancellationBeforeAdmissionRecordsElapsedWait() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1);
+  auto active =
+      scheduler->Submit({1}, 1, 0.0F, {}, false, TimedMetadata(control));
+  control->WaitForAdvance(1);
+  auto cancelled =
+      scheduler->Submit({2}, 1, 0.0F, {}, false, TimedMetadata(control));
+  control->clock->Advance(75);
+  cancelled.Cancel();
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  const auto result = cancelled.Wait();
+  ExpectMilliseconds(result.queue_ms, 75,
+                     "legacy queue field includes cancelled wait");
+  ExpectMilliseconds(result.queue_admission_ms, 75,
+                     "cancelled admission wait is not zero");
+  ExpectMilliseconds(result.total_generation_wall_ms, 75,
+                     "cancelled end-to-end time is retained");
+  Expect(!result.first_token_emitted && result.ttft_ms == 0 &&
+             result.resident_wait_ms == 0 && result.decode_wall_ms == 0 &&
+             result.resident_requests_at_admission == 0,
+         "cancellation without a token is not advertised as a zero-latency "
+         "success");
+}
+
+void TestAdmissionExpiryIsRetryableAndDoesNotExpireResidents() {
+  for (const auto timeout :
+       {std::chrono::milliseconds{0}, std::chrono::milliseconds{60}}) {
+    auto control = std::make_shared<FakeControl>();
+    control->clock = std::make_shared<FakeClock>();
+    control->block_advance_label = 1;
+    auto scheduler = MakeScheduler(control, 1, {}, {.queue_timeout = timeout});
+    auto active =
+        scheduler->Submit({1}, 2, 0.0F, {}, false, TimedMetadata(control));
+    control->WaitForAdvance(1);
+    auto queued =
+        scheduler->Submit({2}, 1, 0.0F, {}, false, TimedMetadata(control));
+    control->clock->Advance(60);
+    control->ReleaseAdvance();
+    bool expired = false;
+    try {
+      (void)queued.Wait();
+    } catch (const TextGenerationError& error) {
+      expired = error.code() == TextGenerationErrorCode::kAdmissionTimeout &&
+                error.http_status() == 429 && error.retryable();
+    }
+    Expect(expired == (timeout.count() != 0),
+           "queue expiry is exact, retryable and opt-in");
+    Expect(active.Wait().completion_tokens == 2,
+           "queue timeout never kills admitted work");
+    const auto events = control->Events();
+    Expect((EventIndex(events, EventKind::kPrefill, 2) == events.size()) ==
+               expired,
+           "expired queue entries never run inference");
+  }
+}
+
+void TestSerialAndBatchedDecodeTimingExcludesPeerPreparation() {
+  for (const bool batched : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->clock = std::make_shared<FakeClock>();
+    control->advance_ms = 10;
+    control->block_advance_label = 1;
+    control->supports_batched_advance = batched;
+    auto scheduler = MakeScheduler(control, 2);
+    auto first =
+        scheduler->Submit({1}, 10, 0.0F, {}, false, TimedMetadata(control));
+    control->WaitForAdvance(1);
+    auto second =
+        scheduler->Submit({2}, 5, 0.0F, {}, false, TimedMetadata(control));
+    control->ReleaseAdvance();
+    const auto a = first.Wait();
+    const auto b = second.Wait();
+    if (!batched) {
+      ExpectMilliseconds(a.decode_ms, 100,
+                         "serial active work excludes peer decode");
+      ExpectMilliseconds(b.decode_ms, 50,
+                         "serial active work charges only own decode");
+    }
+    Expect(a.decode_wall_ms >= a.decode_ms && b.decode_wall_ms >= b.decode_ms,
+           "each request's active work fits inside its resident decode wall");
+  }
+}
+
+void TestCheckpointVectorAndCancellationMetricsPropagate() {
+  for (const bool cancel : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->clock = std::make_shared<FakeClock>();
+    control->prefill_capacity = 2;
+    control->prefix_checkpoint_alignment = 2;
+    std::binary_semaphore captured(0), release(0);
+    std::atomic<std::size_t> snapshots{0};
+    control->snapshot_callback = [&] {
+      if (snapshots.fetch_add(1) == 0) {
+        captured.release();
+        release.acquire();
+      }
+    };
+    auto scheduler = MakeScheduler(control, 1);
+    auto metadata = TimedMetadata(control);
+    metadata.cache_boundaries = {
+        {gufo::server::TextCacheBoundaryKind::kSystemEnd, 2},
+        {gufo::server::TextCacheBoundaryKind::kFullPrompt, 4}};
+    auto request =
+        scheduler->Submit({1, 10, 11, 12}, 1, 0.0F, {}, false, metadata);
+    const bool reached = captured.try_acquire_for(kTestTimeout);
+    if (reached) {
+      // Queue processing proves the scheduler has parked the frozen resident;
+      // the capture worker's entry alone can race that transition.
+      auto probe = scheduler->Submit(
+          {9}, 1, 0.0F, [] { return true; }, false,
+          TimedMetadata(control, "probe"));
+      Expect(probe.Wait().cancelled, "probe synchronizes the parked snapshot");
+    }
+    if (cancel)
+      request.Cancel();
+    control->clock->Advance(30);
+    release.release();
+    Expect(reached, "scheduler vector metadata reaches exact prefix capture");
+    const auto result = request.Wait();
+    Expect(result.cancelled == cancel &&
+               result.prefix_checkpoint_kind == "system_end" &&
+               result.prefix_checkpoint_tokens == 2 &&
+               result.prefix_checkpoint_bytes > 0 &&
+               result.prefix_checkpoint_failures == 0,
+           "checkpoint metrics propagate on normal and cancelled completion");
+    ExpectMilliseconds(result.snapshot_wait_ms, 30,
+                       "snapshot pause is not resident ready wait");
+    ExpectMilliseconds(result.resident_wait_ms, 0,
+                       "isolated capture has no peer wait");
+  }
+}
+
+void TestAdmissionTimingExcludesCacheRestore() {
+  auto control = std::make_shared<FakeControl>();
+  control->clock = std::make_shared<FakeClock>();
+  control->prefill_token_ms = 2;
+  control->advance_ms = 10;
+  control->restore_ms = 40;
+  control->snapshot_callback = [] {};
+  auto scheduler = MakeScheduler(control, 1);
+  (void)scheduler->Submit({1, 10}, 1, 0.0F, {}, false, TimedMetadata(control))
+      .Wait();
+  const auto hit =
+      scheduler->Submit({1, 10}, 1, 0.0F, {}, false, TimedMetadata(control))
+          .Wait();
+  Expect(
+      hit.cache_hit && hit.effective_prefill_tokens == 0,
+      "cache hit reports actual zero prefill rather than full prompt demand");
+  ExpectMilliseconds(hit.queue_admission_ms, 0,
+                     "cache restore is not queue residence");
+  ExpectMilliseconds(hit.total_generation_wall_ms, 50,
+                     "restore remains in end-to-end latency");
+  ExpectMilliseconds(hit.ttft_ms, 40,
+                     "first token includes cache restore latency");
+  ExpectMilliseconds(hit.decode_wall_ms, 10,
+                     "decode wall starts at ready frontier");
+}
+
+void TestGenerationMetricsExplicitlySeparateActiveAndWall() {
+  TextGenerationScheduler::Result result;
+  result.completion_tokens = 10;
+  result.prefill_tokens = 20;
+  result.prefill_ms = 20;
+  result.decode_ms = 100;
+  result.decode_wall_ms = 400;
+  result.total_generation_wall_ms = 1000;
+  result.queue_ms = result.queue_admission_ms = 200;
+  result.resident_wait_ms = 280;
+  result.peer_prefill_ms = 250;
+  result.first_token_emitted = true;
+  result.ttft_ms = 600;
+  result.text = "MUST_NOT_LOG_PRIVATE_OUTPUT";
+  ExpectMilliseconds(gufo::server::ActiveDecodeTokensPerSecond(result), 100,
+                     "active TPS");
+  ExpectMilliseconds(gufo::server::DecodeWallTokensPerSecond(result), 25,
+                     "decode wall TPS");
+  ExpectMilliseconds(gufo::server::GenerationWallTokensPerSecond(result), 10,
+                     "end-to-end TPS");
+  const auto log = gufo::server::GenerationLogDetails(result);
+  Expect(log.find(" active_decode_tps=100.0") != std::string::npos &&
+             log.find(" decode_wall_tps=25.0") != std::string::npos &&
+             log.find(" generation_wall_tps=10.0") != std::string::npos &&
+             log.find(" decode_tps=") == std::string::npos &&
+             log.find(result.text) == std::string::npos,
+         "logs label active TPS and contain no generated content");
+  const auto timings = gufo::server::GenerationTimings(result).dump();
+  Expect(timings.find("\"predicted_time_basis\":\"active_decode\"") !=
+                 std::string::npos &&
+             timings.find("\"decode_wall_ms\":400") != std::string::npos &&
+             timings.find("\"queue_admission_ms\":200") != std::string::npos,
+         "legacy active timings are labeled beside new honest wall metrics");
+  result = {};
+  Expect(gufo::server::DecodeWallTokensPerSecond(result) == 0 &&
+             gufo::server::GenerationWallTokensPerSecond(result) == 0,
+         "absent timing never invents throughput");
+}
+
 int main() {
+  TestCandidatePoliciesAreOptInAndValidated();
+  TestSustainedColdPrefillAndWarmDecode();
+  TestZeroCostDecodeBurstStillYields();
+  TestCachedReplacementsCannotStarvePrefill();
+  TestMeasuredPrefillBudgetAndGeometryFallback();
+  TestAdaptivePrefillFloorAndMtpBurstOvershoot();
+  TestCancellationDuringDecodeRetainsWorkAndWallTiming();
+  TestShortAdmissionHasBoundedBypassAndAging();
+  TestStickyAdmissionPrefersResidentLineage();
+  TestUnknownCacheEstimateIsNotColdHardRejection();
+  TestInflightClientLimitCountsResidentAndPending();
+  TestCancellationBeforeAdmissionRecordsElapsedWait();
+  TestAdmissionExpiryIsRetryableAndDoesNotExpireResidents();
+  TestGenerationMetricsExplicitlySeparateActiveAndWall();
+  TestAdmissionTimingExcludesCacheRestore();
+  TestCheckpointVectorAndCancellationMetricsPropagate();
+  TestSerialAndBatchedDecodeTimingExcludesPeerPreparation();
+  TestJsonMetadataAndConcurrentCursors();
+  TestJsonAdmissionRejectsBeforeInference();
   TestCapturesAtCapacityAllowQueuedProgress();
   TestShutdownCancelsRunnerAcquisition();
   TestSnapshotDoesNotBlockOtherRequests();

@@ -1400,6 +1400,20 @@ ContinuationDiskStore::SaveResult ContinuationDiskStore::Save(
   return impl_->Save(runner, checkpoint_tokens, snapshot, input_identity);
 }
 
+std::size_t ContinuationDiskStore::LongestPrefixTokens(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+    std::span<const std::uint8_t> input_identity) const {
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit)
+    return 0;
+  const auto descriptor = DescriptorForInput(runner, input_identity);
+  if (!descriptor.persistence)
+    return 0;
+  const auto entry =
+      impl_->FindLongestCandidate(*descriptor.persistence, prompt);
+  return entry == impl_->entries.end() ? 0 : entry->tokens.size();
+}
+
 ContinuationDiskStore::RestoreResult
 ContinuationDiskStore::RestoreLongestPrefix(
     const TextModelRunner& runner, TextRunnerState& state,

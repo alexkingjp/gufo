@@ -4,8 +4,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -43,21 +45,70 @@ struct ContinuationCache::Entry {
       : state(std::move(model_state)) {}
 
   std::unique_ptr<ContinuationState> state;
-  std::shared_ptr<const ContinuationSnapshot> snapshot;
   std::vector<ContinuationToken> tokens;
   std::vector<std::uint8_t> input_identity;
   std::vector<ContinuationToken> live_tokens;
   std::vector<std::uint8_t> live_identity;
-  std::size_t snapshot_bytes{0};
   std::uint64_t state_last_used{0};
-  std::uint64_t snapshot_last_used{0};
   bool available{true};
   bool valid{false};
   bool dirty{false};
 };
 
 struct ContinuationCache::Impl {
+  struct SnapshotEntry {
+    std::shared_ptr<const ContinuationSnapshot> snapshot;
+    std::vector<ContinuationToken> tokens;
+    std::vector<std::uint8_t> input_identity;
+    std::size_t snapshot_bytes{0};
+    std::size_t restoring{0};
+    // A lease must not protect an unrelated snapshot that later reuses a slot.
+    std::uint64_t id{0};
+    std::uint64_t last_used{0};
+    std::size_t reuse_count{0};
+    std::size_t protected_leases{0};
+  };
+
+  using OwnerMap =
+      std::map<std::shared_ptr<const void>, std::size_t, std::owner_less<>>;
+  struct LearnedPrefix {
+    std::vector<ContinuationToken> tokens;
+    std::vector<std::uint8_t> identity;
+    std::uint64_t last_seen;
+    std::size_t observations;
+  };
+  OwnerMap owners;
+  std::vector<LearnedPrefix> learned;
+  std::uint64_t learn_clock{0};
+  std::size_t destroying{0};
+
+  void ReapOwners(std::unique_lock<std::mutex>& lock) {
+    if (destroying != 0)
+      return;
+    OwnerMap retiring;
+    std::size_t bytes = 0;
+    for (auto it = owners.begin(); it != owners.end();) {
+      if (it->first.use_count() == 1) {
+        bytes += it->second;
+        retiring.insert(owners.extract(it++));
+      } else {
+        ++it;
+      }
+    }
+    if (retiring.empty())
+      return;
+    // The table controls the last strong reference. Weak expiration happens
+    // before a deleter completes and is not proof that its bytes are free.
+    ++destroying;
+    lock.unlock();
+    retiring.clear();
+    lock.lock();
+    --destroying;
+    retained_snapshot_bytes -= bytes;
+  }
+
   std::vector<std::unique_ptr<Entry>> entries;
+  std::vector<SnapshotEntry> snapshots;
   SnapshotSupport snapshot_support;
   mutable std::mutex mutex;
   std::condition_variable condition;
@@ -73,14 +124,14 @@ struct ContinuationCache::Impl {
 
 ContinuationCache::Lease::Lease(ContinuationCache* cache, std::size_t index,
                                 bool cache_hit, std::size_t cached_tokens,
-                                std::size_t source_index,
+                                std::uint64_t source_id,
                                 std::size_t restored_snapshot_bytes,
                                 double restore_ms) noexcept
     : cache_(cache),
       index_(index),
       cache_hit_(cache_hit),
       cached_tokens_(cached_tokens),
-      source_index_(source_index),
+      source_id_(source_id),
       restored_snapshot_bytes_(restored_snapshot_bytes),
       restore_ms_(restore_ms) {}
 
@@ -93,13 +144,14 @@ ContinuationCache::Lease::Lease(Lease&& other) noexcept
       index_(std::exchange(other.index_, 0)),
       cache_hit_(std::exchange(other.cache_hit_, false)),
       cached_tokens_(std::exchange(other.cached_tokens_, 0)),
-      source_index_(std::exchange(other.source_index_, 0)),
+      source_id_(std::exchange(other.source_id_, 0)),
       restored_snapshot_bytes_(
           std::exchange(other.restored_snapshot_bytes_, 0)),
       restore_ms_(std::exchange(other.restore_ms_, 0.0)),
       restored_from_disk_(std::exchange(other.restored_from_disk_, false)),
       reserved_snapshot_bytes_(
           std::exchange(other.reserved_snapshot_bytes_, 0)),
+      preserve_source_(std::exchange(other.preserve_source_, false)),
       input_identity_(std::move(other.input_identity_)),
       lookup_(std::exchange(other.lookup_, {})) {}
 
@@ -111,11 +163,12 @@ ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     index_ = std::exchange(other.index_, 0);
     cache_hit_ = std::exchange(other.cache_hit_, false);
     cached_tokens_ = std::exchange(other.cached_tokens_, 0);
-    source_index_ = std::exchange(other.source_index_, 0);
+    source_id_ = std::exchange(other.source_id_, 0);
     restored_snapshot_bytes_ = std::exchange(other.restored_snapshot_bytes_, 0);
     restore_ms_ = std::exchange(other.restore_ms_, 0.0);
     restored_from_disk_ = std::exchange(other.restored_from_disk_, false);
     reserved_snapshot_bytes_ = std::exchange(other.reserved_snapshot_bytes_, 0);
+    preserve_source_ = std::exchange(other.preserve_source_, false);
     input_identity_ = std::move(other.input_identity_);
     lookup_ = std::exchange(other.lookup_, {});
   }
@@ -150,7 +203,8 @@ void ContinuationCache::Lease::AdoptRestoredPrefix(std::size_t cached_tokens,
 
 bool ContinuationCache::Lease::TryReserveSnapshot(std::size_t snapshot_bytes,
                                                   std::size_t token_count,
-                                                  bool preserve_source) {
+                                                  bool preserve_source,
+                                                  bool allow_eviction) {
   if (cache_ == nullptr) {
     throw std::logic_error("continuation cache lease is empty");
   }
@@ -158,11 +212,17 @@ bool ContinuationCache::Lease::TryReserveSnapshot(std::size_t snapshot_bytes,
     throw std::logic_error(
         "continuation cache lease already has a snapshot reservation");
   }
-  if (!cache_->ReserveSnapshot(source_index_, snapshot_bytes, token_count,
-                               preserve_source)) {
+  if (preserve_source && !preserve_source_) {
+    cache_->ProtectSource(source_id_, true);
+    preserve_source_ = true;
+  }
+  if (!cache_->ReserveSnapshot(source_id_, snapshot_bytes, token_count,
+                               preserve_source || preserve_source_,
+                               allow_eviction)) {
     return false;
   }
   reserved_snapshot_bytes_ = snapshot_bytes;
+  preserve_source_ = preserve_source_ || preserve_source;
   return true;
 }
 
@@ -185,8 +245,11 @@ std::size_t ContinuationCache::Lease::Commit(
     throw std::logic_error("continuation cache lease is empty");
   }
   const std::size_t retained = cache_->Commit(
-      index_, source_index_, reserved_snapshot_bytes_, std::move(tokens),
-      std::move(snapshot), std::move(input_identity_), std::move(live_tokens));
+      index_, source_id_, reserved_snapshot_bytes_, std::move(tokens),
+      std::move(snapshot), std::move(input_identity_), std::move(live_tokens),
+      true, preserve_source_);
+  if (preserve_source_)
+    cache_->ProtectSource(source_id_, false);
   cache_ = nullptr;
   reserved_snapshot_bytes_ = 0;
   return retained;
@@ -197,9 +260,17 @@ std::size_t ContinuationCache::Lease::PublishSnapshot(
     std::shared_ptr<const ContinuationSnapshot> snapshot) {
   if (cache_ == nullptr)
     throw std::logic_error("continuation cache lease is empty");
-  const auto retained = cache_->Commit(
-      index_, source_index_, reserved_snapshot_bytes_, std::move(tokens),
-      std::move(snapshot), input_identity_, {}, false);
+  std::uint64_t published_id = 0;
+  const auto retained =
+      cache_->Commit(index_, source_id_, reserved_snapshot_bytes_,
+                     std::move(tokens), std::move(snapshot), input_identity_,
+                     {}, false, preserve_source_, &published_id);
+  if (published_id != 0) {
+    if (preserve_source_)
+      cache_->ProtectSource(source_id_, false);
+    source_id_ = published_id;
+    preserve_source_ = true;
+  }
   reserved_snapshot_bytes_ = 0;
   return retained;
 }
@@ -207,10 +278,16 @@ std::size_t ContinuationCache::Lease::PublishSnapshot(
 void ContinuationCache::Lease::Invalidate() noexcept {
   if (cache_ != nullptr) {
     cache_->Invalidate(index_, reserved_snapshot_bytes_);
+    if (preserve_source_)
+      cache_->ProtectSource(source_id_, false);
     cache_ = nullptr;
     reserved_snapshot_bytes_ = 0;
   }
 }
+
+ContinuationCache::ContinuationCache(std::size_t capacity,
+                                     const StateFactory& factory)
+    : ContinuationCache(capacity, factory, SnapshotSupport{}) {}
 
 ContinuationCache::ContinuationCache(std::size_t capacity,
                                      const StateFactory& factory,
@@ -225,6 +302,13 @@ ContinuationCache::ContinuationCache(std::size_t capacity,
         "continuation cache state factory must be callable");
   }
   impl_->snapshot_support = std::move(snapshot_support);
+  if (impl_->snapshot_mode()) {
+    if (impl_->snapshot_support.entry_capacity == 0) {
+      throw std::invalid_argument(
+          "continuation snapshot entry capacity must be at least one");
+    }
+    impl_->snapshots.resize(impl_->snapshot_support.entry_capacity);
+  }
 
   impl_->entries.reserve(capacity);
   for (std::size_t index = 0; index < capacity; ++index) {
@@ -251,11 +335,14 @@ bool ContinuationCache::Lease::HasSnapshotFor(
   if (!cache_)
     return false;
   const std::lock_guard lock(cache_->impl_->mutex);
-  return std::ranges::any_of(cache_->impl_->entries, [&](const auto& source) {
-    return source->valid && source->snapshot &&
-           source->input_identity == input_identity_ &&
-           std::ranges::equal(source->tokens, tokens);
-  });
+  for (auto& source : cache_->impl_->snapshots) {
+    if (source.snapshot && source.input_identity == input_identity_ &&
+        std::ranges::equal(source.tokens, tokens)) {
+      source.last_used = ++cache_->impl_->clock;
+      return true;
+    }
+  }
+  return false;
 }
 
 ContinuationCache::Lease ContinuationCache::Acquire(
@@ -263,45 +350,49 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     const CancellationCheck& is_cancelled,
     std::span<const std::uint8_t> input_identity,
     const std::function<void(ContinuationState&)>& prepare_state,
-    bool reuse_prompt) {
+    bool reuse_prompt, std::size_t min_cached_tokens) {
   while (true) {
     std::unique_lock<std::mutex> lock(impl_->mutex);
 
     const std::size_t no_entry = impl_->entries.size();
-    std::size_t source = no_entry;
+    const std::size_t no_snapshot = impl_->snapshots.size();
+    std::size_t source = no_snapshot;
+    std::size_t live_source = no_entry;
     std::size_t cached_tokens = 0;
-    for (std::size_t index = 0; reuse_prompt && index < impl_->entries.size();
-         ++index) {
-      const auto& entry = *impl_->entries[index];
-      if ((!impl_->snapshot_mode() && !entry.available) || !entry.valid ||
-          !std::equal(entry.input_identity.begin(), entry.input_identity.end(),
-                      input_identity.begin(), input_identity.end()) ||
-          !IsPrefix(entry.tokens, prompt)) {
-        continue;
-      }
-      if (source == no_entry || entry.tokens.size() > cached_tokens) {
-        source = index;
-        cached_tokens = entry.tokens.size();
+    if (reuse_prompt && impl_->snapshot_mode()) {
+      for (std::size_t index = 0; index < impl_->snapshots.size(); ++index) {
+        const auto& entry = impl_->snapshots[index];
+        if (entry.snapshot && entry.tokens.size() >= min_cached_tokens &&
+            std::ranges::equal(entry.input_identity, input_identity) &&
+            IsPrefix(entry.tokens, prompt) &&
+            (source == no_snapshot || entry.tokens.size() > cached_tokens)) {
+          source = index;
+          cached_tokens = entry.tokens.size();
+        }
       }
     }
     // A live final frontier can extend the immutable prompt snapshot. Prefer
     // it on equal prefix lengths too: no restoration or D2H copy is needed.
-    std::size_t live_source = no_entry;
-    if (reuse_prompt && impl_->snapshot_mode()) {
-      for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
-        const auto& entry = *impl_->entries[index];
-        if (entry.available && !entry.live_tokens.empty() &&
-            entry.live_tokens.size() >= cached_tokens &&
-            std::ranges::equal(entry.live_identity, input_identity) &&
-            IsPrefix(entry.live_tokens, prompt)) {
-          live_source = index;
-          cached_tokens = entry.live_tokens.size();
-        }
+    for (std::size_t index = 0; reuse_prompt && index < impl_->entries.size();
+         ++index) {
+      const auto& entry = *impl_->entries[index];
+      const auto& tokens =
+          impl_->snapshot_mode() ? entry.live_tokens : entry.tokens;
+      const auto& identity =
+          impl_->snapshot_mode() ? entry.live_identity : entry.input_identity;
+      if (entry.available && !tokens.empty() &&
+          (impl_->snapshot_mode() || entry.valid) &&
+          tokens.size() >= cached_tokens &&
+          tokens.size() >= min_cached_tokens &&
+          std::ranges::equal(identity, input_identity) &&
+          IsPrefix(tokens, prompt)) {
+        live_source = index;
+        cached_tokens = tokens.size();
       }
     }
 
     const bool live_hit = live_source != no_entry;
-    const bool cache_hit = live_hit || source != no_entry;
+    const bool cache_hit = live_hit || source != no_snapshot;
     ContinuationLookup lookup;
     if (!cache_hit) {
       lookup.miss_reason = reuse_prompt ? "no_checkpoint" : "disabled";
@@ -324,6 +415,10 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         }
       };
       if (reuse_prompt) {
+        for (const auto& entry : impl_->snapshots) {
+          if (entry.snapshot)
+            inspect(entry.tokens, entry.input_identity);
+        }
         for (const auto& entry : impl_->entries) {
           if (entry->valid)
             inspect(entry->tokens, entry->input_identity);
@@ -331,8 +426,8 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         }
       }
     }
-    std::size_t selected = live_hit ? live_source : source;
-    if ((impl_->snapshot_mode() && !live_hit) || !cache_hit) {
+    std::size_t selected = live_source;
+    if (!live_hit) {
       selected = no_entry;
       std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
       for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
@@ -345,6 +440,8 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     }
 
     if (selected != no_entry) {
+      std::vector<std::uint8_t> lease_identity(input_identity.begin(),
+                                               input_identity.end());
       auto& entry = *impl_->entries[selected];
       entry.available = false;
       const bool needs_invalidation = entry.dirty && !cache_hit;
@@ -354,11 +451,17 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       entry.live_identity.clear();
 
       std::shared_ptr<const ContinuationSnapshot> snapshot;
+      std::uint64_t source_id = 0;
       if (impl_->snapshot_mode()) {
-        if (cache_hit && !live_hit) {
-          auto& source_entry = *impl_->entries[source];
-          snapshot = source_entry.snapshot;
-          source_entry.snapshot_last_used = ++impl_->clock;
+        if (source != no_snapshot) {
+          auto& source_entry = impl_->snapshots[source];
+          source_id = source_entry.id;
+          source_entry.last_used = ++impl_->clock;
+          ++source_entry.reuse_count;
+          if (!live_hit) {
+            snapshot = source_entry.snapshot;
+            ++source_entry.restoring;
+          }
         }
       } else {
         entry.valid = false;
@@ -389,6 +492,10 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         entry.state->Invalidate();
         {
           const std::lock_guard<std::mutex> failure_lock(impl_->mutex);
+          if (snapshot) {
+            snapshot.reset();
+            --impl_->snapshots[source].restoring;
+          }
           entry.available = true;
           entry.dirty = false;
           entry.state_last_used = ++impl_->clock;
@@ -396,10 +503,14 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         impl_->condition.notify_one();
         throw;
       }
-      Lease lease(this, selected, cache_hit, cached_tokens, source,
+      if (snapshot) {
+        const std::lock_guard<std::mutex> restore_lock(impl_->mutex);
+        snapshot.reset();
+        --impl_->snapshots[source].restoring;
+      }
+      Lease lease(this, selected, cache_hit, cached_tokens, source_id,
                   restored_snapshot_bytes, restore_ms);
-      lease.input_identity_.assign(input_identity.begin(),
-                                   input_identity.end());
+      lease.input_identity_ = std::move(lease_identity);
       lease.lookup_ = lookup;
       return lease;
     }
@@ -413,8 +524,91 @@ ContinuationCache::Lease ContinuationCache::Acquire(
   }
 }
 
+std::vector<std::size_t> ContinuationCache::LearnPrefixBoundaries(
+    std::span<const ContinuationToken> prompt,
+    std::span<const std::uint8_t> input_identity, std::size_t min_tokens) {
+  constexpr std::size_t kMetadataBytes = 2 * 1024 * 1024;
+  constexpr std::size_t kCandidateCapacity = 8;
+  constexpr std::uint64_t kMaxAgeRequests = 128;
+  const std::lock_guard lock(impl_->mutex);
+  const auto now = ++impl_->learn_clock;
+  std::erase_if(impl_->learned, [&](const auto& entry) {
+    return now - entry.last_seen > kMaxAgeRequests;
+  });
+  std::size_t common = 0;
+  const auto inspect = [&](const auto& tokens, const auto& identity) {
+    if (!std::ranges::equal(identity, input_identity))
+      return;
+    const auto count =
+        static_cast<std::size_t>(std::mismatch(tokens.begin(), tokens.end(),
+                                               prompt.begin(), prompt.end())
+                                     .first -
+                                 tokens.begin());
+    if (count < tokens.size() && count < prompt.size())
+      common = std::max(common, count);
+  };
+  for (const auto& entry : impl_->snapshots) {
+    if (entry.snapshot)
+      inspect(entry.tokens, entry.input_identity);
+  }
+  for (const auto& entry : impl_->entries) {
+    if (entry->valid)
+      inspect(entry->tokens, entry->input_identity);
+    inspect(entry->live_tokens, entry->live_identity);
+  }
+  if (common >= min_tokens && common != 0 &&
+      input_identity.size() <= kMetadataBytes &&
+      common <= (kMetadataBytes - input_identity.size()) /
+                    sizeof(ContinuationToken)) {
+    const auto prefix = prompt.first(common);
+    auto found = std::ranges::find_if(impl_->learned, [&](const auto& entry) {
+      return std::ranges::equal(entry.identity, input_identity) &&
+             std::ranges::equal(entry.tokens, prefix);
+    });
+    if (found != impl_->learned.end()) {
+      ++found->observations;
+      found->last_seen = now;
+    } else {
+      const auto required =
+          common * sizeof(ContinuationToken) + input_identity.size();
+      const auto fits = [&] {
+        std::size_t used = 0;
+        for (const auto& entry : impl_->learned)
+          used += entry.tokens.size() * sizeof(ContinuationToken) +
+                  entry.identity.size();
+        return impl_->learned.size() < kCandidateCapacity &&
+               required <= kMetadataBytes - used;
+      };
+      while (!fits()) {
+        const auto oldest = std::ranges::min_element(
+            impl_->learned, {}, &Impl::LearnedPrefix::last_seen);
+        impl_->learned.erase(oldest);
+      }
+      impl_->learned.push_back({{prefix.begin(), prefix.end()},
+                                {input_identity.begin(), input_identity.end()},
+                                now,
+                                1});
+    }
+  }
+  std::vector<std::size_t> candidates;
+  for (auto& entry : impl_->learned) {
+    if (entry.tokens.size() >= min_tokens &&
+        entry.tokens.size() < prompt.size() &&
+        std::ranges::equal(entry.identity, input_identity) &&
+        IsPrefix(entry.tokens, prompt)) {
+      candidates.push_back(entry.tokens.size());
+    }
+  }
+  std::ranges::sort(candidates, std::greater<>{});
+  return candidates;
+}
+
 std::size_t ContinuationCache::capacity() const noexcept {
   return impl_->entries.size();
+}
+
+std::size_t ContinuationCache::snapshot_entry_capacity() const noexcept {
+  return impl_->snapshots.size();
 }
 
 std::size_t ContinuationCache::snapshot_capacity_bytes() const noexcept {
@@ -423,7 +617,8 @@ std::size_t ContinuationCache::snapshot_capacity_bytes() const noexcept {
 }
 
 std::size_t ContinuationCache::retained_snapshot_bytes() const noexcept {
-  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::unique_lock lock(impl_->mutex);
+  impl_->ReapOwners(lock);
   return impl_->retained_snapshot_bytes;
 }
 
@@ -432,92 +627,130 @@ std::size_t ContinuationCache::reserved_snapshot_bytes() const noexcept {
   return impl_->reserved_snapshot_bytes;
 }
 
+std::vector<SlotLineage> ContinuationCache::FreeSlotLineages() const {
+  std::vector<SlotLineage> lineages;
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  lineages.reserve(impl_->entries.size());
+  for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
+    const auto& entry = *impl_->entries[index];
+    if (!entry.available)
+      continue;
+    const auto& tokens = impl_->snapshot_mode() ? entry.live_tokens
+                                                : entry.tokens;
+    const auto& identity = impl_->snapshot_mode() ? entry.live_identity
+                                                  : entry.input_identity;
+    if (tokens.empty() || identity.empty())
+      continue;
+    if (impl_->snapshot_mode() || entry.valid)
+      lineages.push_back(
+          {index, tokens.size(), {identity.begin(), identity.end()}});
+  }
+  return lineages;
+}
+
+void ContinuationCache::ProtectSource(std::uint64_t source_id,
+                                      bool protect) noexcept {
+  if (source_id == 0)
+    return;
+  const std::lock_guard lock(impl_->mutex);
+  for (auto& entry : impl_->snapshots) {
+    if (entry.snapshot && entry.id == source_id) {
+      if (protect)
+        ++entry.protected_leases;
+      else if (entry.protected_leases != 0)
+        --entry.protected_leases;
+      break;
+    }
+  }
+}
+
 ContinuationState& ContinuationCache::StateAt(std::size_t index) {
   return *impl_->entries.at(index)->state;
 }
 
-bool ContinuationCache::ReserveSnapshot(std::size_t source_index,
+bool ContinuationCache::ReserveSnapshot(std::uint64_t source_id,
                                         std::size_t snapshot_bytes,
                                         std::size_t token_count,
-                                        bool preserve_source) {
-  std::vector<std::shared_ptr<const ContinuationSnapshot>> removed_snapshots;
+                                        bool preserve_source,
+                                        bool allow_eviction) {
   std::vector<SnapshotEvent> events;
   bool admitted = false;
-  {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto make_event = [&](SnapshotEventAction action,
-                                SnapshotEventReason reason, std::size_t bytes,
-                                std::size_t tokens) {
-      return SnapshotEvent{
-          .action = action,
-          .reason = reason,
-          .snapshot_bytes = bytes,
-          .token_count = tokens,
-          .retained_snapshot_bytes = impl_->retained_snapshot_bytes,
-          .reserved_snapshot_bytes = impl_->reserved_snapshot_bytes,
-          .capacity_bytes = impl_->snapshot_capacity_bytes,
-      };
-    };
-    const auto fits = [&] {
-      const std::size_t used =
-          impl_->retained_snapshot_bytes + impl_->reserved_snapshot_bytes;
-      return snapshot_bytes != 0 && used <= impl_->snapshot_capacity_bytes &&
-             snapshot_bytes <= impl_->snapshot_capacity_bytes - used;
-    };
-    const auto oldest_snapshot = [&](bool allow_source) {
-      std::size_t selected = impl_->entries.size();
-      std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-      for (std::size_t candidate = 0; candidate < impl_->entries.size();
-           ++candidate) {
-        const auto& entry = *impl_->entries[candidate];
-        if (!entry.valid || entry.snapshot == nullptr ||
-            (!allow_source && candidate == source_index)) {
-          continue;
-        }
-        if (entry.snapshot_last_used < oldest) {
-          selected = candidate;
-          oldest = entry.snapshot_last_used;
-        }
-      }
-      return selected;
-    };
-
-    const bool can_fit_after_eviction =
-        snapshot_bytes != 0 &&
-        impl_->reserved_snapshot_bytes <= impl_->snapshot_capacity_bytes &&
-        snapshot_bytes <=
-            impl_->snapshot_capacity_bytes - impl_->reserved_snapshot_bytes;
-    while (can_fit_after_eviction && !fits()) {
-      std::size_t target = oldest_snapshot(false);
-      if (target == impl_->entries.size() && !preserve_source) {
-        target = oldest_snapshot(true);
-      }
-      if (target == impl_->entries.size()) {
+  std::unique_lock lock(impl_->mutex);
+  impl_->ReapOwners(lock);
+  const auto make_event = [&](SnapshotEventAction action,
+                              SnapshotEventReason reason, std::size_t bytes,
+                              std::size_t tokens) {
+    return SnapshotEvent{action,
+                         reason,
+                         bytes,
+                         tokens,
+                         impl_->retained_snapshot_bytes,
+                         impl_->reserved_snapshot_bytes,
+                         impl_->snapshot_capacity_bytes};
+  };
+  const auto fits = [&] {
+    const auto used =
+        impl_->retained_snapshot_bytes + impl_->reserved_snapshot_bytes;
+    if (snapshot_bytes == 0 || used > impl_->snapshot_capacity_bytes)
+      return false;
+    const auto free = impl_->snapshot_capacity_bytes - used;
+    // An optional early tap leaves room for at least one ordinary snapshot.
+    return snapshot_bytes <= (allow_eviction ? free : free / 2);
+  };
+  const bool possible =
+      snapshot_bytes != 0 &&
+      impl_->reserved_snapshot_bytes <= impl_->snapshot_capacity_bytes &&
+      snapshot_bytes <=
+          impl_->snapshot_capacity_bytes - impl_->reserved_snapshot_bytes;
+  while (possible && !fits() && allow_eviction) {
+    std::size_t target = impl_->snapshots.size();
+    for (const bool allow_source : {false, true}) {
+      if (allow_source && preserve_source)
         break;
+      for (std::size_t i = 0; i < impl_->snapshots.size(); ++i) {
+        const auto& entry = impl_->snapshots[i];
+        if (!entry.snapshot || entry.restoring != 0 ||
+            entry.protected_leases != 0 ||
+            (!allow_source && entry.id == source_id))
+          continue;
+        if (target == impl_->snapshots.size() ||
+            std::tie(entry.reuse_count, entry.last_used) <
+                std::tie(impl_->snapshots[target].reuse_count,
+                         impl_->snapshots[target].last_used))
+          target = i;
       }
-      auto& entry = *impl_->entries[target];
-      const std::size_t removed_bytes = entry.snapshot_bytes;
-      const std::size_t removed_tokens = entry.tokens.size();
-      removed_snapshots.push_back(std::move(entry.snapshot));
-      entry.tokens.clear();
-      entry.snapshot_bytes = 0;
-      entry.valid = false;
-      impl_->retained_snapshot_bytes -= removed_bytes;
-      events.push_back(make_event(SnapshotEventAction::kRemoved,
-                                  SnapshotEventReason::kByteCapacity,
-                                  removed_bytes, removed_tokens));
+      if (target != impl_->snapshots.size())
+        break;
     }
-
-    if (fits()) {
-      impl_->reserved_snapshot_bytes += snapshot_bytes;
-      admitted = true;
-    } else {
-      events.push_back(make_event(SnapshotEventAction::kSkipped,
-                                  SnapshotEventReason::kByteCapacity,
-                                  snapshot_bytes, token_count));
-    }
+    if (target == impl_->snapshots.size())
+      break;
+    auto& entry = impl_->snapshots[target];
+    events.push_back(make_event(SnapshotEventAction::kRemoved,
+                                SnapshotEventReason::kByteCapacity,
+                                entry.snapshot_bytes, entry.tokens.size()));
+    auto retired = std::move(entry.snapshot);
+    entry = {};
+    // Physical owners keep external/restore/destructor readers charged.
+    ++impl_->destroying;
+    lock.unlock();
+    retired.reset();
+    lock.lock();
+    --impl_->destroying;
+    impl_->ReapOwners(lock);
   }
-  removed_snapshots.clear();
+  if (fits()) {
+    impl_->reserved_snapshot_bytes += snapshot_bytes;
+    admitted = true;
+  } else {
+    events.push_back(make_event(SnapshotEventAction::kSkipped,
+                                SnapshotEventReason::kByteCapacity,
+                                snapshot_bytes, token_count));
+  }
+  for (auto& event : events) {
+    event.retained_snapshot_bytes = impl_->retained_snapshot_bytes;
+    event.reserved_snapshot_bytes = impl_->reserved_snapshot_bytes;
+  }
+  lock.unlock();
   EmitSnapshotEvents(impl_->snapshot_support.on_event, events);
   return admitted;
 }
@@ -549,156 +782,218 @@ void ContinuationCache::SkipSnapshot(std::size_t reservation_bytes,
 }
 
 std::size_t ContinuationCache::Commit(
-    std::size_t index, std::size_t source_index, std::size_t reservation_bytes,
+    std::size_t index, std::uint64_t source_id, std::size_t reservation_bytes,
     std::vector<ContinuationToken> tokens,
     std::shared_ptr<const ContinuationSnapshot> snapshot,
     std::vector<std::uint8_t> input_identity,
-    std::vector<ContinuationToken> live_tokens, bool release_state) {
-  const std::size_t token_count = tokens.size();
-  const std::size_t snapshot_bytes =
-      snapshot != nullptr ? snapshot->PayloadBytes() : 0;
-  SnapshotEventReason skip_reason = SnapshotEventReason::kCaptureFailure;
-  bool retain_snapshot = impl_->snapshot_mode() && snapshot != nullptr &&
-                         !tokens.empty() && reservation_bytes != 0 &&
-                         snapshot_bytes != 0 &&
-                         snapshot_bytes == reservation_bytes;
-  if (snapshot != nullptr &&
-      (reservation_bytes == 0 || snapshot_bytes == 0 ||
-       snapshot_bytes != reservation_bytes || tokens.empty())) {
-    skip_reason = SnapshotEventReason::kReservationMismatch;
-  }
-
-  std::shared_ptr<const ContinuationSnapshot> retained_snapshot;
-  if (retain_snapshot) {
-    retained_snapshot = std::move(snapshot);
-  }
-
-  std::vector<std::shared_ptr<const ContinuationSnapshot>> removed_snapshots;
-  std::vector<SnapshotEvent> events;
-  std::size_t retained_bytes = 0;
-  {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (reservation_bytes <= impl_->reserved_snapshot_bytes) {
-      impl_->reserved_snapshot_bytes -= reservation_bytes;
+    std::vector<ContinuationToken> live_tokens, bool release_state,
+    bool preserve_source, std::uint64_t* published_id) {
+  const auto token_count = tokens.size();
+  const auto snapshot_bytes = snapshot ? snapshot->PayloadBytes() : 0;
+  auto reason = SnapshotEventReason::kCaptureFailure;
+  Impl::OwnerMap owners;
+  bool retain = impl_->snapshot_mode() && snapshot && !tokens.empty() &&
+                reservation_bytes != 0 && snapshot_bytes != 0;
+  if (snapshot) {
+    const auto physical = snapshot->StorageOwners();
+    if (physical.empty()) {
+      owners.emplace(snapshot, snapshot_bytes);
+      retain = retain && snapshot_bytes == reservation_bytes;
     } else {
-      impl_->reserved_snapshot_bytes = 0;
-      retain_snapshot = false;
-      skip_reason = SnapshotEventReason::kReservationMismatch;
+      for (const auto& owner : physical) {
+        const auto found = owners.find(owner.owner);
+        if (!owner.owner || owner.bytes == 0 ||
+            (found != owners.end() && found->second != owner.bytes)) {
+          retain = false;
+          break;
+        }
+        if (found == owners.end())
+          owners.emplace(owner.owner, owner.bytes);
+      }
     }
-
-    const auto make_event = [&](SnapshotEventAction action,
-                                SnapshotEventReason reason, std::size_t bytes,
-                                std::size_t token_count) {
-      return SnapshotEvent{
-          .action = action,
-          .reason = reason,
-          .snapshot_bytes = bytes,
-          .token_count = token_count,
-          .retained_snapshot_bytes = impl_->retained_snapshot_bytes,
-          .reserved_snapshot_bytes = impl_->reserved_snapshot_bytes,
-          .capacity_bytes = impl_->snapshot_capacity_bytes,
-      };
+    if (!retain)
+      reason = SnapshotEventReason::kReservationMismatch;
+  }
+  std::shared_ptr<const ContinuationSnapshot> retired;
+  std::vector<SnapshotEvent> events;
+  events.reserve(1);
+  std::size_t retained_bytes = 0;
+  std::size_t release_bytes = 0;
+  std::size_t published_target = impl_->snapshots.size();
+  {
+    std::unique_lock lock(impl_->mutex);
+    impl_->ReapOwners(lock);
+    release_bytes = std::min(reservation_bytes, impl_->reserved_snapshot_bytes);
+    if (release_bytes != reservation_bytes) {
+      retain = false;
+      reason = SnapshotEventReason::kReservationMismatch;
+    }
+    const auto event = [&](SnapshotEventAction action, SnapshotEventReason why,
+                           std::size_t bytes, std::size_t count) {
+      return SnapshotEvent{action,
+                           why,
+                           bytes,
+                           count,
+                           impl_->retained_snapshot_bytes,
+                           impl_->reserved_snapshot_bytes,
+                           impl_->snapshot_capacity_bytes};
     };
-
-    auto& state_entry = *impl_->entries.at(index);
+    auto& state = *impl_->entries.at(index);
     if (impl_->snapshot_mode()) {
       if (release_state) {
-        state_entry.live_tokens = std::move(live_tokens);
-        state_entry.live_identity = input_identity;
+        state.live_tokens = std::move(live_tokens);
+        state.live_identity = input_identity;
       }
-      if (retain_snapshot) {
-        const std::size_t no_entry = impl_->entries.size();
-        std::size_t target = no_entry;
-        bool exact_replacement = false;
-        for (std::size_t candidate = 0; candidate < impl_->entries.size();
-             ++candidate) {
-          const auto& entry = *impl_->entries[candidate];
-          if (entry.valid && entry.tokens == tokens &&
+      const auto none = impl_->snapshots.size();
+      std::size_t target = none;
+      bool exact = false;
+      if (retain) {
+        for (std::size_t i = 0; i < none; ++i) {
+          const auto& entry = impl_->snapshots[i];
+          if (entry.snapshot && entry.tokens == tokens &&
               entry.input_identity == input_identity) {
-            target = candidate;
-            exact_replacement = true;
+            exact = true;
+            if (entry.restoring == 0 &&
+                (entry.protected_leases == 0 ||
+                 (entry.id == source_id && preserve_source &&
+                  entry.protected_leases == 1)))
+              target = i;
             break;
           }
         }
-        if (target == no_entry) {
-          for (std::size_t candidate = 0; candidate < impl_->entries.size();
-               ++candidate) {
-            if (!impl_->entries[candidate]->valid) {
-              target = candidate;
+        if (target == none && !exact) {
+          for (std::size_t i = 0; i < none; ++i) {
+            if (!impl_->snapshots[i].snapshot) {
+              target = i;
               break;
             }
           }
         }
-        if (target == no_entry) {
-          std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-          for (std::size_t candidate = 0; candidate < impl_->entries.size();
-               ++candidate) {
-            if (impl_->entries.size() > 1 && candidate == source_index) {
-              continue;
+        if (target == none && !exact) {
+          for (const bool allow_source : {false, true}) {
+            if (allow_source && preserve_source)
+              break;
+            for (std::size_t i = 0; i < none; ++i) {
+              const auto& entry = impl_->snapshots[i];
+              if (entry.restoring != 0 || entry.protected_leases != 0 ||
+                  (!allow_source && entry.id == source_id))
+                continue;
+              if (target == none ||
+                  std::tie(entry.reuse_count, entry.last_used) <
+                      std::tie(impl_->snapshots[target].reuse_count,
+                               impl_->snapshots[target].last_used))
+                target = i;
             }
-            const auto& entry = *impl_->entries[candidate];
-            if (entry.snapshot_last_used < oldest) {
-              target = candidate;
-              oldest = entry.snapshot_last_used;
-            }
+            if (target != none)
+              break;
           }
         }
-        if (target == no_entry) {
-          target = source_index < impl_->entries.size() ? source_index : index;
+        std::size_t added = 0;
+        for (const auto& [owner, bytes] : owners) {
+          const auto found = impl_->owners.find(owner);
+          if (found != impl_->owners.end()) {
+            if (bytes != found->second)
+              retain = false;
+          } else if (bytes > reservation_bytes - added) {
+            retain = false;
+          } else {
+            added += bytes;
+          }
         }
-
-        auto& snapshot_entry = *impl_->entries[target];
-        if (snapshot_entry.snapshot != nullptr) {
-          const std::size_t removed_bytes = snapshot_entry.snapshot_bytes;
-          const std::size_t removed_tokens = snapshot_entry.tokens.size();
-          removed_snapshots.push_back(std::move(snapshot_entry.snapshot));
-          impl_->retained_snapshot_bytes -= removed_bytes;
-          snapshot_entry.tokens.clear();
-          snapshot_entry.snapshot_bytes = 0;
-          snapshot_entry.valid = false;
-          events.push_back(make_event(
-              SnapshotEventAction::kRemoved,
-              exact_replacement ? SnapshotEventReason::kExactReplacement
-                                : SnapshotEventReason::kEntryCapacity,
-              removed_bytes, removed_tokens));
+        const auto used = impl_->retained_snapshot_bytes +
+                          impl_->reserved_snapshot_bytes - release_bytes;
+        if (target == none) {
+          retain = false;
+          reason = SnapshotEventReason::kEntryCapacity;
+        } else if (!retain || used > impl_->snapshot_capacity_bytes ||
+                   added > impl_->snapshot_capacity_bytes - used) {
+          retain = false;
+          reason = SnapshotEventReason::kReservationMismatch;
         }
-        const std::size_t used =
-            impl_->retained_snapshot_bytes + impl_->reserved_snapshot_bytes;
-        if (used > impl_->snapshot_capacity_bytes ||
-            snapshot_bytes > impl_->snapshot_capacity_bytes - used) {
-          retain_snapshot = false;
-          skip_reason = SnapshotEventReason::kReservationMismatch;
-        } else {
-          snapshot_entry.tokens = std::move(tokens);
-          snapshot_entry.input_identity = std::move(input_identity);
-          snapshot_entry.snapshot = std::move(retained_snapshot);
-          snapshot_entry.snapshot_bytes = snapshot_bytes;
-          snapshot_entry.valid = !snapshot_entry.tokens.empty();
-          snapshot_entry.snapshot_last_used = ++impl_->clock;
-          impl_->retained_snapshot_bytes += snapshot_bytes;
+        if (retain) {
+          auto& entry = impl_->snapshots[target];
+          if (entry.snapshot) {
+            events.push_back(event(SnapshotEventAction::kRemoved,
+                                   exact
+                                       ? SnapshotEventReason::kExactReplacement
+                                       : SnapshotEventReason::kEntryCapacity,
+                                   entry.snapshot_bytes, entry.tokens.size()));
+            retired = std::move(entry.snapshot);
+          }
+          entry = {};
+          entry.snapshot = std::move(snapshot);
+          entry.tokens = std::move(tokens);
+          entry.input_identity = std::move(input_identity);
+          entry.snapshot_bytes = snapshot_bytes;
+          entry.id = entry.last_used = ++impl_->clock;
+          if (retired) {
+            ++entry.restoring;
+            published_target = target;
+          }
+          if (published_id) {
+            *published_id = entry.id;
+            ++entry.protected_leases;
+          }
+          // Transfer preallocated ownership nodes without allocating after
+          // publication has mutated a retained slot.
+          impl_->owners.merge(owners);
+          impl_->retained_snapshot_bytes += added;
+          impl_->reserved_snapshot_bytes -= release_bytes;
+          release_bytes = 0;
           retained_bytes = snapshot_bytes;
         }
-        if (!retain_snapshot) {
-          events.push_back(make_event(SnapshotEventAction::kSkipped,
-                                      skip_reason, snapshot_bytes,
-                                      token_count));
+      }
+      if (!retain && (snapshot || reservation_bytes != 0)) {
+        // External callers can still hold rejected candidates. Keep their
+        // physical owners resident until our table can destroy them safely.
+        for (auto it = owners.begin(); it != owners.end();) {
+          const auto& [owner, bytes] = *it;
+          if (!owner || bytes == 0 ||
+              (!impl_->owners.contains(owner) &&
+               bytes > std::numeric_limits<std::size_t>::max() -
+                           impl_->retained_snapshot_bytes)) {
+            it = owners.erase(it);
+            continue;
+          }
+          if (!impl_->owners.contains(owner))
+            impl_->retained_snapshot_bytes += bytes;
+          ++it;
         }
-      } else if (snapshot != nullptr || reservation_bytes != 0) {
-        events.push_back(make_event(SnapshotEventAction::kSkipped, skip_reason,
-                                    snapshot_bytes, token_count));
+        impl_->owners.merge(owners);
+        impl_->reserved_snapshot_bytes -= release_bytes;
+        release_bytes = 0;
+        events.push_back(event(SnapshotEventAction::kSkipped, reason,
+                               snapshot_bytes, token_count));
       }
     } else {
-      state_entry.tokens = std::move(tokens);
-      state_entry.input_identity = std::move(input_identity);
-      state_entry.valid = !state_entry.tokens.empty();
+      state.tokens = std::move(tokens);
+      state.input_identity = std::move(input_identity);
+      state.valid = !state.tokens.empty();
     }
     if (release_state) {
-      state_entry.dirty = true;
-      state_entry.available = true;
-      state_entry.state_last_used = ++impl_->clock;
+      state.dirty = true;
+      state.available = true;
+      state.state_last_used = ++impl_->clock;
+    }
+    ++impl_->destroying;
+  }
+  // Neither rejected candidates nor retired owners become free during their
+  // destructors. Destruction can reenter admission on another execution slot.
+  owners.clear();
+  snapshot.reset();
+  retired.reset();
+  {
+    std::unique_lock lock(impl_->mutex);
+    --impl_->destroying;
+    impl_->reserved_snapshot_bytes -= release_bytes;
+    impl_->ReapOwners(lock);
+    if (published_target != impl_->snapshots.size())
+      --impl_->snapshots[published_target].restoring;
+    for (auto& event : events) {
+      event.retained_snapshot_bytes = impl_->retained_snapshot_bytes;
+      event.reserved_snapshot_bytes = impl_->reserved_snapshot_bytes;
     }
   }
-  removed_snapshots.clear();
   EmitSnapshotEvents(impl_->snapshot_support.on_event, events);
   impl_->condition.notify_all();
   return retained_bytes;

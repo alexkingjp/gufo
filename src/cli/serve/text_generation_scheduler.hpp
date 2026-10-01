@@ -34,6 +34,10 @@ inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
 
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
+  std::chrono::milliseconds target_chunk_time{100};
+  std::size_t min_chunk_tokens{1};
+  /// Opt-in until changed physical prefill shapes pass model numerical gates.
+  bool adaptive_chunking{false};
 };
 
 struct TextSchedulerPolicy {
@@ -45,6 +49,25 @@ struct TextSchedulerPolicy {
   std::size_t max_buffered_output_bytes_total{
       kDefaultMaxBufferedOutputBytesTotal};
   std::chrono::milliseconds request_timeout{0};
+  /// Zero retains the legacy one-round decode policy; checked at work
+  /// boundaries.
+  std::chrono::milliseconds decode_burst{0};
+  std::size_t max_decode_steps_per_burst{32};
+  /// Zero disables queue expiry. Admitted requests use request_timeout instead.
+  std::chrono::milliseconds queue_timeout{0};
+  /// Includes pending and resident requests. Zero disables this additional cap.
+  std::size_t max_inflight_requests_per_client{0};
+  bool prefer_short_prefill{false};
+  std::size_t max_admission_bypasses{2};
+  std::chrono::milliseconds admission_aging{1000};
+  /// Bounds known remaining work only; unknown cache eligibility is not a miss.
+  std::size_t max_inflight_prefill_tokens{0};
+  /// Prefer a queued request whose input identity matches the resident
+  /// lineage of a free runner slot: the slot is adopted without a restore
+  /// and the live state keeps serving the same conversation in place.
+  /// Per-client FIFO is untouched; unrelated heads wait behind at most
+  /// capacity() consecutive sticky admissions.
+  bool sticky_admission{true};
 };
 
 /// Single-owner scheduler for opaque text-model runner states.
@@ -54,6 +77,8 @@ struct TextSchedulerPolicy {
 class TextGenerationScheduler {
 public:
   using Clock = std::chrono::steady_clock;
+  /// Must be monotonic, thread-safe and non-throwing; injectable for CPU tests.
+  using ClockSource = std::function<Clock::time_point()>;
   using Result = TextGenerationBackend::Result;
   using CancellationCheck = TextGenerationBackend::CancellationCheck;
   using TokenCallback = TextGenerationBackend::TokenCallback;
@@ -65,6 +90,11 @@ public:
     std::shared_ptr<const TextPromptContext> prompt_context;
     bool cache_prompt{true};
     std::size_t cache_prefix_tokens{0};
+    std::shared_ptr<const sampling::TokenConstraint> json_constraint;
+    std::vector<TextCacheBoundary> cache_boundaries;
+    /// Source-verified eligible uncached work, not a diagnostic longest prefix.
+    /// Missing means unknown and cannot cause a token-budget rejection.
+    std::optional<std::size_t> estimated_prefill_tokens;
   };
 
   class Request {
@@ -96,7 +126,8 @@ public:
 
   explicit TextGenerationScheduler(std::shared_ptr<TextRunnerPool> runner_pool,
                                    TextPrefillPolicy prefill_policy = {},
-                                   TextSchedulerPolicy scheduler_policy = {});
+                                   TextSchedulerPolicy scheduler_policy = {},
+                                   ClockSource clock = Clock::now);
   ~TextGenerationScheduler();
 
   TextGenerationScheduler(const TextGenerationScheduler&) = delete;

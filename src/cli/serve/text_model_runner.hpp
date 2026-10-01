@@ -29,11 +29,27 @@ struct TextPromptContext {
   std::vector<std::uint8_t> cache_identity;
 };
 
+enum class TextCacheBoundaryKind : std::uint8_t {
+  kSystemEnd,
+  kLastUserStart,
+  kHistoryEnd,
+  kFullPrompt,
+  kLearnedPrefix,
+};
+
+/// Renderer-verified exact token prefix; learned boundaries come from the
+/// cache.
+struct TextCacheBoundary {
+  TextCacheBoundaryKind kind{TextCacheBoundaryKind::kFullPrompt};
+  std::size_t token_count{0};
+};
+
 struct TextPreparedPrompt {
   std::vector<TextRunnerToken> tokens;
   std::shared_ptr<const TextPromptContext> context;
   /// Snapshot before mutable assistant framing. Zero uses the complete prompt.
   std::size_t cache_prefix_tokens{0};
+  std::vector<TextCacheBoundary> cache_boundaries;
 };
 
 struct TextRunnerDiskCacheOptions {
@@ -69,6 +85,10 @@ struct TextRunnerCapabilities {
   /// Zero means no physical-width limit.
   std::size_t batched_multi_token_decode_max_width{0};
   bool prefix_reuse{true};
+  bool json_constraints{false};
+  /// Natural prefill quantum with independently restorable chunk frontiers.
+  /// Zero disables additional RAM checkpoint placement for this provider.
+  std::size_t prefix_checkpoint_alignment{0};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -101,6 +121,10 @@ struct TextRunnerResourceClaim {
   std::optional<std::size_t> resident_weights_bytes;
   std::optional<std::size_t> state_capacity_bytes;
   std::optional<std::size_t> per_request_state_bytes;
+  /// Bytes shared by every request state, reserved once (elastic history
+  /// budgets: sessions grow their K/V caches inside this pool on demand).
+  /// Absent or zero means each state is independently sized.
+  std::optional<std::size_t> shared_state_bytes;
   std::optional<std::size_t> temporary_scratch_bytes;
   /// Aggregate bytes currently available for immutable retained snapshots.
   ///
@@ -232,6 +256,15 @@ public:
   [[nodiscard]] virtual std::string Decode(
       std::span<const TextRunnerToken> tokens) const = 0;
 
+  /// Binds a compiled grammar to this runner's exact token bytes before
+  /// admission.
+  [[nodiscard]] virtual std::shared_ptr<const sampling::TokenConstraint>
+  CreateJsonConstraint(std::shared_ptr<const JsonConstraint>,
+                       sampling::TokenConstraint::Options = {}) const {
+    throw std::invalid_argument(
+        "model does not support JSON constrained decoding");
+  }
+
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> CreateState()
       const = 0;
 
@@ -280,6 +313,17 @@ public:
   /// The default implementations fail explicitly for runners that do not
   /// advertise the corresponding capabilities.
   [[nodiscard]] virtual std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const;
+  /// Conservative physical allocation upper bound, including owner metadata.
+  /// Shared-parent delta estimates require a pinned capture plan, not a hint.
+  [[nodiscard]] virtual std::size_t SnapshotAllocationBytes(
+      const TextRunnerState& state) const;
+  /// Reservation estimate for a capture that inherits append-only history
+  /// from the state's resident parent snapshot. Must be evaluated against
+  /// the same pinned parent Snapshot() will use — the frozen state provides
+  /// that pin — and may overestimate but never underestimate the bytes the
+  /// cache charges at commit. Defaults to the full allocation bound.
+  [[nodiscard]] virtual std::size_t SnapshotIncrementalBytes(
       const TextRunnerState& state) const;
   /// May run on a capture worker while this state is frozen. Must not mutate
   /// shared execution scratch; other sessions may execute concurrently.
@@ -332,6 +376,12 @@ public:
       std::size_t shared_prefix_bytes{0};
       std::size_t shared_prefix_failures{0};
       double shared_prefix_ms{0.0};
+      TextCacheBoundaryKind prefix_checkpoint_kind{
+          TextCacheBoundaryKind::kFullPrompt};
+      std::size_t prefix_checkpoint_tokens{0};
+      std::size_t prefix_checkpoint_bytes{0};
+      double prefix_checkpoint_ms{0.0};
+      std::size_t prefix_checkpoint_failures{0};
     };
 
     Request();
@@ -394,6 +444,10 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// Resident lineages of currently free runner slots (see
+  /// ContinuationCache::FreeSlotLineages). Lets admission hand a freed slot
+  /// to the queued request that can reuse its live state.
+  [[nodiscard]] std::vector<SlotLineage> FreeSlotLineages() const;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
@@ -406,7 +460,9 @@ public:
       const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
-      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0);
+      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
+      std::shared_ptr<const sampling::TokenConstraint> json_constraint = {},
+      std::vector<TextCacheBoundary> cache_boundaries = {});
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
 

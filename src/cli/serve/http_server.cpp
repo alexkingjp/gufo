@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <random>
 #include <ranges>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include "src/cli/serve/asr_service.hpp"
@@ -391,25 +393,83 @@ bool ReadTextContent(const json::Value* content, std::string* out) {
   return true;
 }
 
+bool ReadResponsesReasoning(const json::Value& item, std::string* reasoning) {
+  if (item.contains("role") || item.contains("tool_calls"))
+    return false;
+  if (const auto* id = item.find("id");
+      id && (!id->is_string() || id->str().empty()))
+    return false;
+  if (const auto* status = item.find("status");
+      status && (!status->is_string() || (status->str() != "completed" &&
+                                          status->str() != "incomplete")))
+    return false;
+  if (const auto* encrypted = item.find("encrypted_content");
+      encrypted && !encrypted->is_null())
+    return false;
+  // Gufo emits raw reasoning, not summaries or opaque encrypted state. Do not
+  // substitute either for the model's original assistant thought.
+  if (const auto* summary = item.find("summary");
+      summary && (!summary->is_array() || !summary->empty()))
+    return false;
+  const auto* content = item.find("content");
+  if (!content || !content->is_array() || content->empty())
+    return false;
+  for (const auto& part : content->items()) {
+    const auto* text = part.find("text");
+    if (!part.is_object() || part.member_str("type") != "reasoning_text" ||
+        !text || !text->is_string())
+      return false;
+    reasoning->append(text->str());
+  }
+  return !reasoning->empty();
+}
+
 bool ReadTextMessages(const json::Value* input,
-                      std::vector<tokenization::ChatMessage>* messages) {
+                      std::vector<tokenization::ChatMessage>* messages,
+                      bool responses = false) {
   if (input == nullptr || !input->is_array() || input->empty())
     return false;
+  std::optional<std::string> reasoning;
+  const auto flush_reasoning = [&] {
+    if (reasoning.has_value()) {
+      // A budget-limited response can contain reasoning without a visible
+      // answer. Retain that assistant turn instead of attaching it to a user.
+      messages->emplace_back(tokenization::ChatRole::kAssistant, std::string{},
+                             std::string{}, std::move(*reasoning));
+      reasoning.reset();
+    }
+  };
   for (const auto& item : input->items()) {
+    if (responses && item.member_str("type") == "reasoning") {
+      flush_reasoning();
+      reasoning.emplace();
+      if (!ReadResponsesReasoning(item, &*reasoning))
+        return false;
+      continue;
+    }
     const auto role = item.member_str("role");
+    const auto* type = item.find("type");
     if (!item.is_object() ||
         (role != "user" && role != "assistant" && role != "system" &&
          role != "developer") ||
-        item.member_str("type", "message") != "message" ||
-        item.contains("tool_calls")) {
+        (type && (!type->is_string() || type->str() != "message")) ||
+        item.contains("tool_calls") ||
+        (responses && item.contains("reasoning_content"))) {
       return false;
     }
     tokenization::ChatMessage message;
     message.role = RoleFrom(role);
     if (!ReadTextContent(item.find("content"), &message.content))
       return false;
+    if (message.role != tokenization::ChatRole::kAssistant)
+      flush_reasoning();
+    if (reasoning.has_value()) {
+      message.thought = std::move(*reasoning);
+      reasoning.reset();
+    }
     messages->push_back(std::move(message));
   }
+  flush_reasoning();
   return true;
 }
 
@@ -418,12 +478,379 @@ HttpResponse InvalidCompatibilityRequest(std::string_view message) {
              "invalid_request_error", "invalid_request");
 }
 
-// Compatibility routes implement a synchronous text subset. Validate options
-// before dispatch so a client never gets an answer to a different request.
+bool ResponsesFunctionName(std::string_view name) {
+  return !name.empty() && name.size() <= 64 &&
+         std::ranges::all_of(name, [](unsigned char c) {
+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+         });
+}
+
+std::optional<HttpResponse> NormalizeResponsesTools(const json::Value& body,
+                                                    json::Value* chat) {
+  if (const auto* tools = body.find("tools")) {
+    if (!tools->is_array())
+      return InvalidCompatibilityRequest("'tools' must be an array");
+    (*chat)["tools"] = json::Value::array();
+    std::unordered_set<std::string> names;
+    for (const auto& tool : tools->items()) {
+      if (!tool.is_object() || tool.member_str("type") != "function")
+        return InvalidCompatibilityRequest("only function tools are supported");
+      const bool nested = tool.contains("function");
+      const auto* function = nested ? tool.find("function") : &tool;
+      if (!function->is_object())
+        return InvalidCompatibilityRequest("function tools must be objects");
+      if (nested) {
+        for (const auto& [key, value] : tool.members()) {
+          if (key != "type" && key != "function")
+            return InvalidCompatibilityRequest("ambiguous function tool shape");
+        }
+      }
+      for (const auto& [key, value] : function->members()) {
+        if (key != "name" && key != "description" && key != "parameters" &&
+            key != "strict" && (nested || key != "type"))
+          return InvalidCompatibilityRequest(
+              "unsupported function tool field '" + key + "'");
+      }
+      const auto name = function->member_str("name");
+      if (!ResponsesFunctionName(name) || !names.insert(name).second)
+        return InvalidCompatibilityRequest(
+            "function names must be unique, 1-64 letters, digits, '_', '-' or "
+            "'.'");
+      auto normalized = json::Value::object();
+      normalized["type"] = "function";
+      normalized["function"]["name"] = name;
+      if (const auto* description = function->find("description")) {
+        if (!description->is_string() && !description->is_null())
+          return InvalidCompatibilityRequest(
+              "tool description must be a string");
+        if (!description->is_null())
+          normalized["function"]["description"] = *description;
+      }
+      if (const auto* strict = function->find("strict")) {
+        if (!strict->is_bool() && !strict->is_null())
+          return InvalidCompatibilityRequest("tool strict must be a boolean");
+        if (!strict->is_null())
+          normalized["function"]["strict"] = *strict;
+      }
+      const auto* parameters = function->find("parameters");
+      if (parameters && !parameters->is_null()) {
+        if (!parameters->is_object())
+          return InvalidCompatibilityRequest(
+              "tool parameters must be an object schema");
+        if (const auto* type = parameters->find("type");
+            type && (!type->is_string() || type->str() != "object"))
+          return InvalidCompatibilityRequest(
+              "tool parameters must describe an object");
+        if (const auto* properties = parameters->find("properties");
+            properties && !properties->is_object())
+          return InvalidCompatibilityRequest(
+              "tool parameter properties must be an object");
+        if (const auto* required = parameters->find("required")) {
+          if (!required->is_array() ||
+              std::ranges::any_of(required->items(), [](const auto& value) {
+                return !value.is_string();
+              }))
+            return InvalidCompatibilityRequest(
+                "tool required must be an array of names");
+        }
+        normalized["function"]["parameters"] = *parameters;
+      } else {
+        // An omitted schema declares a no-argument function, not arbitrary
+        // arguments. Use the same explicit definition for both prompt and API.
+        normalized["function"]["parameters"] = json::parse(
+            R"({"type":"object","properties":{},"additionalProperties":false})");
+      }
+      (*chat)["tools"].push_back(std::move(normalized));
+    }
+  }
+  if (const auto* choice = body.find("tool_choice")) {
+    if (choice->is_object() && choice->contains("name")) {
+      if (choice->member_str("type") != "function" || choice->size() != 2 ||
+          !ResponsesFunctionName(choice->member_str("name")))
+        return InvalidCompatibilityRequest(
+            "named tool_choice requires type and function name");
+      (*chat)["tool_choice"]["type"] = "function";
+      (*chat)["tool_choice"]["function"]["name"] = *choice->find("name");
+    } else {
+      if (choice->is_object()) {
+        const auto* function = choice->find("function");
+        if (choice->size() != 2 || !function || !function->is_object() ||
+            function->size() != 1)
+          return InvalidCompatibilityRequest("invalid named tool_choice");
+      }
+      (*chat)["tool_choice"] = *choice;
+    }
+  }
+  if (const auto* parallel = body.find("parallel_tool_calls")) {
+    if (!parallel->is_bool())
+      return InvalidCompatibilityRequest(
+          "parallel_tool_calls must be a boolean");
+    (*chat)["parallel_tool_calls"] = *parallel;
+  }
+  return std::nullopt;
+}
+
+bool ResponsesHistoryMetadata(const json::Value& item) {
+  if (const auto* id = item.find("id");
+      id && (!id->is_string() || id->str().empty()))
+    return false;
+  if (const auto* status = item.find("status");
+      status && (!status->is_string() || (status->str() != "completed" &&
+                                          status->str() != "incomplete")))
+    return false;
+  return true;
+}
+
+std::optional<HttpResponse> NormalizeResponsesInput(const json::Value& body,
+                                                    json::Value* messages) {
+  *messages = json::Value::array();
+  const auto message = [](const std::string& role, const std::string& text) {
+    auto value = json::Value::object();
+    value["role"] = role;
+    value["content"] = text;
+    return value;
+  };
+  if (const auto* instructions = body.find("instructions");
+      instructions && !instructions->is_null()) {
+    if (!instructions->is_string())
+      return InvalidCompatibilityRequest(
+          "'instructions' must be a string or null");
+    messages->push_back(message("system", instructions->str()));
+  }
+  const auto* input = body.find("input");
+  if (input && input->is_string() && !input->str().empty()) {
+    messages->push_back(message("user", input->str()));
+    return std::nullopt;
+  }
+  if (!input || !input->is_array() || input->empty())
+    return InvalidCompatibilityRequest(
+        "'input' must be nonempty text or an item array");
+
+  struct PendingCall {
+    std::string id;
+    std::string name;
+    std::optional<std::string> output;
+  };
+  std::vector<PendingCall> pending;
+  std::unordered_set<std::string> call_ids;
+  std::optional<json::Value> assistant;
+  bool assistant_has_message = false;
+  bool receiving_outputs = false;
+  const auto flush_assistant = [&] {
+    if (assistant) {
+      messages->push_back(std::move(*assistant));
+      assistant.reset();
+    }
+    assistant_has_message = false;
+  };
+  const auto ensure_assistant = [&]() -> json::Value& {
+    if (!assistant)
+      assistant = message("assistant", "");
+    return *assistant;
+  };
+  for (const auto& item : input->items()) {
+    if (!item.is_object() || !ResponsesHistoryMetadata(item))
+      return InvalidCompatibilityRequest(
+          "input items require valid objects, IDs and terminal status");
+    const auto type = item.member_str("type", "message");
+    if (const auto* value = item.find("type"); value && !value->is_string())
+      return InvalidCompatibilityRequest("input item type must be a string");
+    if (type == "function_call_output") {
+      if (item.contains("role") || item.contains("tool_calls") ||
+          item.contains("reasoning_content"))
+        return InvalidCompatibilityRequest(
+            "function_call_output cannot have message fields");
+      const auto id = item.member_str("call_id");
+      auto found = std::ranges::find(pending, id, &PendingCall::id);
+      if (id.empty() || found == pending.end() || found->output.has_value())
+        return InvalidCompatibilityRequest(
+            "function_call_output requires an unmatched call_id from input");
+      std::string text;
+      if (!ReadTextContent(item.find("output"), &text))
+        return InvalidCompatibilityRequest(
+            "function output must be a string or text content-part array; "
+            "images and files are unsupported");
+      flush_assistant();
+      receiving_outputs = true;
+      found->output = std::move(text);
+      if (std::ranges::all_of(pending, [](const auto& call) {
+            return call.output.has_value();
+          })) {
+        // Qwen renders tool results positionally. Correlate by call_id first,
+        // then restore call order even when parallel results arrive reversed.
+        for (auto& call : pending) {
+          auto value = message("tool", *call.output);
+          value["tool_call_id"] = call.id;
+          value["name"] = call.name;
+          messages->push_back(std::move(value));
+        }
+        pending.clear();
+        receiving_outputs = false;
+      }
+      continue;
+    }
+    if (receiving_outputs)
+      return InvalidCompatibilityRequest(
+          "all pending function calls need outputs before the next input item");
+    if (type == "function_call") {
+      if (item.contains("role") || item.contains("tool_calls") ||
+          item.contains("reasoning_content") || item.contains("content"))
+        return InvalidCompatibilityRequest(
+            "function_call cannot have message fields");
+      const auto id = item.member_str("call_id");
+      const auto name = item.member_str("name");
+      const auto* arguments = item.find("arguments");
+      if (id.empty() || !ResponsesFunctionName(name) ||
+          !call_ids.insert(id).second || !arguments || !arguments->is_string())
+        return InvalidCompatibilityRequest(
+            "function_call requires a unique call_id, name and JSON arguments "
+            "string");
+      try {
+        if (!json::parse(arguments->str()).is_object())
+          return InvalidCompatibilityRequest(
+              "function arguments must encode a JSON object");
+      } catch (const std::exception&) {
+        return InvalidCompatibilityRequest(
+            "function arguments must encode a complete JSON object; use '{}' "
+            "for no arguments");
+      }
+      auto call = json::Value::object();
+      call["id"] = id;
+      call["type"] = "function";
+      call["function"]["name"] = name;
+      call["function"]["arguments"] = *arguments;
+      ensure_assistant()["tool_calls"].push_back(std::move(call));
+      pending.push_back({id, name, std::nullopt});
+      continue;
+    }
+    if (type == "reasoning") {
+      if (!pending.empty())
+        return InvalidCompatibilityRequest(
+            "function calls need outputs before another reasoning turn");
+      std::string reasoning;
+      if (!ReadResponsesReasoning(item, &reasoning))
+        return InvalidCompatibilityRequest(
+            "reasoning items must contain nonempty raw reasoning_text");
+      flush_assistant();
+      ensure_assistant()["reasoning_content"] = std::move(reasoning);
+      continue;
+    }
+    const auto role = item.member_str("role");
+    if (type != "message" ||
+        (role != "user" && role != "assistant" && role != "system" &&
+         role != "developer") ||
+        item.contains("tool_calls") || item.contains("reasoning_content"))
+      return InvalidCompatibilityRequest(
+          "input supports text messages, reasoning, function_call and "
+          "function_call_output items only");
+    std::string text;
+    if (!ReadTextContent(item.find("content"), &text))
+      return InvalidCompatibilityRequest(
+          "message content must be a string or text content-part array");
+    if (role == "assistant") {
+      if (assistant_has_message) {
+        if (!pending.empty())
+          return InvalidCompatibilityRequest(
+              "function calls need outputs before another assistant turn");
+        flush_assistant();
+      }
+      ensure_assistant()["content"] = std::move(text);
+      assistant_has_message = true;
+    } else {
+      if (!pending.empty())
+        return InvalidCompatibilityRequest(
+            "function calls need outputs before another message");
+      flush_assistant();
+      messages->push_back(message(role, text));
+    }
+  }
+  if (!pending.empty())
+    return InvalidCompatibilityRequest(
+        "every input function_call requires a matching function_call_output");
+  flush_assistant();
+  return std::nullopt;
+}
+
+bool SameJson(const json::Value& left, const json::Value& right) {
+  if (left.type() != right.type())
+    return false;
+  if (left.is_object()) {
+    if (left.size() != right.size())
+      return false;
+    for (const auto& [name, value] : left.members()) {
+      const auto* other = right.find(name);
+      if (!other || !SameJson(value, *other))
+        return false;
+    }
+    return true;
+  }
+  if (left.is_array()) {
+    if (left.size() != right.size())
+      return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+      if (!SameJson(left.items()[index], right.items()[index]))
+        return false;
+    }
+    return true;
+  }
+  return left.dump() == right.dump();
+}
+
+std::optional<HttpResponse> NormalizeResponsesFormat(const json::Value& body,
+                                                     json::Value* chat) {
+  const auto* text = body.find("text");
+  if (!text)
+    return std::nullopt;
+  if (!text->is_object())
+    return InvalidCompatibilityRequest("'text' must be an object");
+  for (const auto& [name, value] : text->members()) {
+    if (name != "format")
+      return InvalidCompatibilityRequest("unsupported text control '" + name +
+                                         "'");
+  }
+  const auto* format = text->find("format");
+  if (!format)
+    return std::nullopt;
+  if (!format->is_object())
+    return InvalidCompatibilityRequest("'text.format' must be an object");
+  const auto type = format->member_str("type");
+  for (const auto& [name, value] : format->members()) {
+    if (name != "type" &&
+        (type != "json_schema" || (name != "name" && name != "schema" &&
+                                   name != "strict" && name != "description")))
+      return InvalidCompatibilityRequest("unsupported text.format field '" +
+                                         name + "'");
+  }
+  auto normalized = *format;
+  if (type == "json_schema") {
+    normalized = json::Value::object();
+    normalized["type"] = "json_schema";
+    normalized["json_schema"] = json::Value::object();
+    for (const auto& [name, value] : format->members()) {
+      if (name != "type")
+        normalized["json_schema"][name] = value;
+    }
+  } else if (type != "json_object" && type != "text") {
+    return InvalidCompatibilityRequest("unsupported text.format type");
+  }
+  if (const auto* conventional = body.find("response_format");
+      conventional && !SameJson(*conventional, normalized))
+    return InvalidCompatibilityRequest(
+        "text.format and response_format disagree");
+  if (type == "text" && format->size() == 1 &&
+      !body.contains("response_format"))
+    return std::nullopt;
+  (*chat)["response_format"] = std::move(normalized);
+  return std::nullopt;
+}
+
+// Validate compatibility options before dispatch so a client never gets an
+// answer to a different request. Only Responses supports streaming/reasoning.
 std::optional<HttpResponse> ReadCompatibilityOptions(
     const json::Value& body, TextGenerationBackend& backend,
     std::string_view token_field, std::size_t* max_tokens,
-    sampling::SamplingConfig* sampling_config) {
+    sampling::SamplingConfig* sampling_config, bool responses = false) {
   if (!body.is_object())
     return InvalidCompatibilityRequest("request body must be an object");
   if (const auto* model = body.find("model"); model != nullptr) {
@@ -434,9 +861,13 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
                  "invalid_request_error", "model_not_found");
   }
   for (const std::string field : {"stream", "echo", "store", "background"}) {
-    if (const auto* value = body.find(field);
-        value != nullptr && (!value->is_bool() || value->as_bool())) {
-      return InvalidCompatibilityRequest("'" + field + "' must be false");
+    if (const auto* value = body.find(field); value != nullptr) {
+      if (responses && field == "stream") {
+        if (!value->is_bool())
+          return InvalidCompatibilityRequest("'stream' must be a boolean");
+      } else if (!value->is_bool() || value->as_bool()) {
+        return InvalidCompatibilityRequest("'" + field + "' must be false");
+      }
     }
   }
   for (const std::string field : {"n", "best_of"}) {
@@ -467,6 +898,12 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
                                   "truncation",
                                   "modalities",
                                   "audio"}) {
+    if (responses && (field == "reasoning" || field == "reasoning_effort" ||
+                      field == "thinking" || field == "chat_template_kwargs" ||
+                      field == "tools" || field == "tool_choice" ||
+                      field == "parallel_tool_calls" || field == "text" ||
+                      field == "response_format" || field == "include"))
+      continue;
     if (body.contains(field)) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
@@ -622,6 +1059,396 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
              "invalid_prompt");
 }
 
+json::Value ResponsesUsage(const json::Value& chat_usage) {
+  auto usage = json::Value::object();
+  usage["input_tokens"] = chat_usage.member_size("prompt_tokens");
+  usage["output_tokens"] = chat_usage.member_size("completion_tokens");
+  usage["total_tokens"] = chat_usage.member_size("total_tokens");
+  if (const auto* details = chat_usage.find("prompt_tokens_details"))
+    usage["input_tokens_details"] = *details;
+  // The backend counts all generated tokens, but not a separate reasoning
+  // subtotal. Omit that unmeasured breakdown rather than reporting a false
+  // zero.
+  return usage;
+}
+
+json::Value ResponsesPart(std::string_view text, bool reasoning) {
+  auto part = json::Value::object();
+  part["type"] = reasoning ? "reasoning_text" : "output_text";
+  part["text"] = std::string(text);
+  if (!reasoning) {
+    part["annotations"] = json::Value::array();
+    part["logprobs"] = json::Value::array();
+  }
+  return part;
+}
+
+json::Value ResponsesItem(const std::string& id, std::string_view text,
+                          bool reasoning, const char* status,
+                          bool include_content = true) {
+  auto item = json::Value::object();
+  item["id"] = id;
+  item["type"] = reasoning ? "reasoning" : "message";
+  item["status"] = status;
+  if (reasoning)
+    item["summary"] = json::Value::array();
+  else
+    item["role"] = "assistant";
+  item["content"] = json::Value::array();
+  if (include_content)
+    item["content"].push_back(ResponsesPart(text, reasoning));
+  return item;
+}
+
+json::Value ResponsesFunctionItem(const std::string& id,
+                                  const std::string& call_id,
+                                  const std::string& name,
+                                  const std::string& arguments,
+                                  const char* status) {
+  auto item = json::Value::object();
+  item["id"] = id;
+  item["type"] = "function_call";
+  item["status"] = status;
+  item["call_id"] = call_id;
+  item["name"] = name;
+  item["arguments"] = arguments;
+  return item;
+}
+
+json::Value ResponsesEnvelope(const json::Value& body, const json::Value& chat,
+                              const std::string& model, std::size_t max_tokens,
+                              const sampling::SamplingConfig& sampling) {
+  auto response = json::Value::object();
+  response["id"] = "resp_" + RandomId();
+  response["object"] = "response";
+  response["created_at"] = Now();
+  response["status"] = "in_progress";
+  response["error"] = json::Value();
+  response["incomplete_details"] = json::Value();
+  response["model"] = model;
+  response["output"] = json::Value::array();
+  response["usage"] = json::Value();
+  response["tools"] = json::Value::array();
+  if (const auto* tools = chat.find("tools")) {
+    for (const auto& tool : tools->items()) {
+      auto flat = *tool.find("function");
+      flat["type"] = "function";
+      response["tools"].push_back(std::move(flat));
+    }
+  }
+  response["tool_choice"] = response["tools"].empty() ? "none" : "auto";
+  if (const auto* choice = chat.find("tool_choice")) {
+    if (choice->is_object()) {
+      response["tool_choice"] = json::Value::object();
+      response["tool_choice"]["type"] = "function";
+      response["tool_choice"]["name"] =
+          choice->find("function")->member_str("name");
+    } else {
+      response["tool_choice"] = *choice;
+    }
+  }
+  response["parallel_tool_calls"] = !body.contains("parallel_tool_calls") ||
+                                    body.find("parallel_tool_calls")->as_bool();
+  if (const auto* format = chat.find("response_format")) {
+    response["text"]["format"] = *format;
+    if (format->member_str("type") == "json_schema") {
+      response["text"]["format"] = *format->find("json_schema");
+      response["text"]["format"]["type"] = "json_schema";
+    }
+  } else {
+    response["text"]["format"]["type"] = "text";
+  }
+  for (const auto* field : {"metadata", "reasoning"}) {
+    if (const auto* value = body.find(field))
+      response[field] = *value;
+  }
+  response["store"] = false;
+  response["background"] = false;
+  response["max_output_tokens"] = max_tokens;
+  response["temperature"] = static_cast<double>(sampling.temperature);
+  response["top_p"] = static_cast<double>(sampling.top_p);
+  if (const auto* instructions = body.find("instructions"))
+    response["instructions"] = *instructions;
+  return response;
+}
+
+// Chat owns request validation, admission, UTF-8/reasoning parsing and metrics.
+// This adapter consumes its complete SSE frames, never arbitrary network bytes.
+class ResponsesStream {
+public:
+  ResponsesStream(json::Value response, const HttpResponse::BodyWriter& writer)
+      : response_(std::move(response)), writer_(writer) {}
+
+  bool Push(std::string_view frame) {
+    if (!connected_)
+      return false;
+    if (!started_) {
+      started_ = true;
+      if (!ResponseEvent("response.created") ||
+          !ResponseEvent("response.in_progress"))
+        return false;
+    }
+    if (frame == "data: [DONE]\n\n") {
+      if (!terminal_) {
+        auto error = json::Value::object();
+        error["code"] = "generation_failed";
+        error["message"] =
+            "generation ended without usage or a terminal choice";
+        return Fail(error);
+      }
+      return connected_;
+    }
+    const auto event = json::parse(frame.substr(6));
+    if (const auto* error = event.find("error"))
+      return Fail(*error);
+    if (terminal_)
+      return connected_;
+    if (const auto* usage = event.find("usage")) {
+      if (finish_reason_.empty())
+        throw std::logic_error("chat usage arrived before its terminal choice");
+      const bool limited = finish_reason_ == "length";
+      if (!active_ && output_.empty() && !Open(false))
+        return false;
+      if (!Close(limited ? "incomplete" : "completed") ||
+          !CloseFunctions(limited ? "incomplete" : "completed"))
+        return false;
+      response_["output"] = Output();
+      response_["usage"] = ResponsesUsage(*usage);
+      if (const auto* timings = event.find("timings"))
+        response_["timings"] = *timings;
+      response_["status"] = limited ? "incomplete" : "completed";
+      if (limited)
+        response_["incomplete_details"]["reason"] = "max_output_tokens";
+      else
+        response_["completed_at"] = Now();
+      terminal_ = true;
+      return ResponseEvent(limited ? "response.incomplete"
+                                   : "response.completed");
+    }
+    if (const auto* choices = event.find("choices")) {
+      for (const auto& choice : choices->items()) {
+        if (const auto* delta = choice.find("delta")) {
+          if (!Text(delta->member_str("reasoning_content"), true) ||
+              !Text(delta->member_str("content"), false))
+            return false;
+          if (const auto* tools = delta->find("tool_calls")) {
+            for (const auto& tool : tools->items()) {
+              if (!Function(tool))
+                return false;
+            }
+          }
+        }
+        const auto finish = choice.member_str("finish_reason");
+        if (!finish.empty())
+          finish_reason_ = finish;
+      }
+    }
+    return connected_;
+  }
+
+  [[nodiscard]] bool terminal() const { return terminal_; }
+
+private:
+  bool Emit(const char* type, json::Value event) {
+    if (!connected_)
+      return false;
+    event["type"] = type;
+    event["sequence_number"] = sequence_++;
+    connected_ = writer_("event: " + std::string(type) +
+                         "\ndata: " + event.dump() + "\n\n");
+    return connected_;
+  }
+
+  bool ResponseEvent(const char* type) {
+    auto event = json::Value::object();
+    event["response"] = response_;
+    return Emit(type, std::move(event));
+  }
+
+  json::Value Output() const {
+    auto output = json::Value::array();
+    for (const auto& item : output_)
+      output.push_back(item);
+    return output;
+  }
+
+  json::Value ItemEvent() const {
+    auto event = json::Value::object();
+    event["output_index"] = active_index_;
+    return event;
+  }
+
+  json::Value ContentEvent() const {
+    auto event = ItemEvent();
+    event["item_id"] = item_id_;
+    event["content_index"] = 0;
+    return event;
+  }
+
+  bool Open(bool reasoning) {
+    active_ = true;
+    reasoning_ = reasoning;
+    item_id_ = (reasoning ? "rs_" : "msg_") + RandomId();
+    text_.clear();
+    active_index_ = output_.size();
+    output_.push_back(
+        ResponsesItem(item_id_, {}, reasoning_, "in_progress", false));
+    auto event = ItemEvent();
+    event["item"] = output_.back();
+    if (!Emit("response.output_item.added", std::move(event)))
+      return false;
+    event = ContentEvent();
+    event["part"] = ResponsesPart({}, reasoning_);
+    return Emit("response.content_part.added", std::move(event));
+  }
+
+  bool Text(const std::string& text, bool reasoning) {
+    if (text.empty())
+      return true;
+    if (active_ && reasoning != reasoning_ && !Close("completed"))
+      return false;
+    if (!active_ && !Open(reasoning))
+      return false;
+    text_ += text;
+    auto event = ContentEvent();
+    event["delta"] = text;
+    if (!reasoning_)
+      event["logprobs"] = json::Value::array();
+    return Emit(reasoning_ ? "response.reasoning_text.delta"
+                           : "response.output_text.delta",
+                std::move(event));
+  }
+
+  bool Close(const char* status) {
+    if (!active_)
+      return true;
+    auto event = ContentEvent();
+    event["text"] = text_;
+    if (!reasoning_)
+      event["logprobs"] = json::Value::array();
+    if (!Emit(reasoning_ ? "response.reasoning_text.done"
+                         : "response.output_text.done",
+              std::move(event)))
+      return false;
+    event = ContentEvent();
+    event["part"] = ResponsesPart(text_, reasoning_);
+    if (!Emit("response.content_part.done", std::move(event)))
+      return false;
+    event = ItemEvent();
+    auto item = ResponsesItem(item_id_, text_, reasoning_, status);
+    event["item"] = item;
+    if (!Emit("response.output_item.done", std::move(event)))
+      return false;
+    output_[active_index_] = std::move(item);
+    active_ = false;
+    return true;
+  }
+
+  bool Function(const json::Value& delta) {
+    if (!Close("completed"))
+      return false;
+    const auto index = delta.member_size("index");
+    auto found = functions_.find(index);
+    const auto* function = delta.find("function");
+    if (found == functions_.end()) {
+      if (!response_.find("parallel_tool_calls")->as_bool() &&
+          !functions_.empty())
+        throw std::runtime_error(
+            "multiple calls violate parallel_tool_calls=false");
+      const auto call_id = delta.member_str("id");
+      const auto name = function ? function->member_str("name") : "";
+      if (call_id.empty() || name.empty())
+        throw std::logic_error("chat tool delta is missing call identity");
+      const auto output_index = output_.size();
+      auto item = ResponsesFunctionItem("fc_" + RandomId(), call_id, name, "",
+                                        "in_progress");
+      auto event = json::Value::object();
+      event["output_index"] = output_index;
+      event["item"] = item;
+      output_.push_back(std::move(item));
+      found = functions_.emplace(index, output_index).first;
+      if (!Emit("response.output_item.added", std::move(event)))
+        return false;
+    }
+    auto& item = output_[found->second];
+    if ((delta.contains("id") &&
+         delta.member_str("id") != item.member_str("call_id")) ||
+        (function && function->contains("name") &&
+         function->member_str("name") != item.member_str("name")))
+      throw std::logic_error("chat tool delta changed call identity");
+    const auto* arguments = function ? function->find("arguments") : nullptr;
+    if (arguments) {
+      if (!arguments->is_string())
+        throw std::logic_error("chat function arguments delta is not a string");
+      item["arguments"] = item.member_str("arguments") + arguments->str();
+      if (!arguments->str().empty()) {
+        auto event = json::Value::object();
+        event["output_index"] = found->second;
+        event["item_id"] = item.member_str("id");
+        event["delta"] = *arguments;
+        return Emit("response.function_call_arguments.delta", std::move(event));
+      }
+    }
+    return true;
+  }
+
+  bool CloseFunctions(const char* status) {
+    // Calls may be interleaved by Chat index. Keep Responses output indices in
+    // first-appearance order and finalize only after the entire batch succeeds.
+    for (auto& item : output_) {
+      if (item.member_str("type") != "function_call" ||
+          item.member_str("status") != "in_progress")
+        continue;
+      const auto index = static_cast<std::size_t>(&item - output_.data());
+      auto event = json::Value::object();
+      event["output_index"] = index;
+      event["item_id"] = item.member_str("id");
+      event["name"] = item.member_str("name");
+      event["arguments"] = item.member_str("arguments");
+      if (!Emit("response.function_call_arguments.done", std::move(event)))
+        return false;
+      item["status"] = status;
+      event = json::Value::object();
+      event["output_index"] = index;
+      event["item"] = item;
+      if (!Emit("response.output_item.done", std::move(event)))
+        return false;
+    }
+    return true;
+  }
+
+  bool Fail(const json::Value& error) {
+    if (terminal_)
+      return connected_;
+    if (!Close("incomplete") || !CloseFunctions("incomplete"))
+      return false;
+    auto event = error;
+    event["param"] = json::Value();
+    if (!Emit("error", std::move(event)))
+      return false;
+    response_["status"] = "failed";
+    response_["error"] = error;
+    response_["output"] = Output();
+    terminal_ = true;
+    return ResponseEvent("response.failed");
+  }
+
+  json::Value response_;
+  const HttpResponse::BodyWriter& writer_;
+  std::vector<json::Value> output_;
+  std::map<std::size_t, std::size_t> functions_;
+  std::size_t active_index_{0};
+  std::string item_id_;
+  std::string text_;
+  std::string finish_reason_;
+  std::size_t sequence_{0};
+  bool connected_{true};
+  bool started_{false};
+  bool active_{false};
+  bool reasoning_{false};
+  bool terminal_{false};
+};
+
 HttpResponse OpenAiResponses(const HttpRequest& req,
                              TextGenerationBackend& b) try {
   json::Value body;
@@ -634,66 +1461,133 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
 
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
-  if (auto error = ReadCompatibilityOptions(body, b, "max_output_tokens",
-                                            &max_tokens, &sampling_config)) {
+  if (auto error = ReadCompatibilityOptions(
+          body, b, "max_output_tokens", &max_tokens, &sampling_config, true)) {
     return std::move(*error);
   }
 
-  std::vector<tokenization::ChatMessage> messages;
-  if (const auto* instructions = body.find("instructions")) {
-    if (!instructions->is_string()) {
-      return InvalidCompatibilityRequest("'instructions' must be a string");
+  if (const auto* include = body.find("include")) {
+    if (!include->is_array() ||
+        std::ranges::any_of(include->items(), [](const auto& item) {
+          return !item.is_string() ||
+                 item.str() != "reasoning.encrypted_content";
+        }))
+      return InvalidCompatibilityRequest(
+          "only include:['reasoning.encrypted_content'] is supported as an "
+          "advisory request; Gufo returns raw reasoning");
+  }
+  if (const auto* metadata = body.find("metadata");
+      metadata && !metadata->is_null()) {
+    if (!metadata->is_object() || metadata->size() > 16)
+      return InvalidCompatibilityRequest(
+          "metadata must contain at most 16 string pairs");
+    for (const auto& [key, value] : metadata->members()) {
+      if (key.size() > 64 || !value.is_string() || value.str().size() > 512)
+        return InvalidCompatibilityRequest(
+            "metadata keys/values exceed string limits");
     }
-    messages.push_back(
-        {tokenization::ChatRole::kSystem, instructions->str(), "", ""});
   }
-  const auto* input = body.find("input");
-  if (input != nullptr && input->is_string() && !input->str().empty()) {
-    messages.push_back({tokenization::ChatRole::kUser, input->str(), "", ""});
-  } else if (!ReadTextMessages(input, &messages)) {
-    return InvalidCompatibilityRequest(
-        "'input' must be nonempty text or text messages; use "
-        "/v1/chat/completions for images and tools");
+  auto chat_body = json::Value::object();
+  for (const auto& [name, value] : body.members()) {
+    if (name != "input" && name != "instructions" &&
+        name != "max_output_tokens" && name != "reasoning" && name != "tools" &&
+        name != "tool_choice" && name != "parallel_tool_calls" &&
+        name != "text")
+      chat_body[name] = value;
   }
-
-  ChatRequest chat{std::move(messages)};
-  chat.client_id = req.client_id;
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
-
-  json::Value resp = json::Value::object();
-  resp["id"] = "resp_" + RandomId();
-  resp["object"] = "response";
-  const bool limited =
-      res.finish_reason == TextGenerationBackend::FinishReason::kLength;
-  resp["status"] = limited ? "incomplete" : "completed";
-  resp["incomplete_details"] = json::Value();
-  if (limited) {
-    resp["incomplete_details"]["reason"] = "max_output_tokens";
+  if (auto error = NormalizeResponsesTools(body, &chat_body))
+    return std::move(*error);
+  if (auto error = NormalizeResponsesFormat(body, &chat_body))
+    return std::move(*error);
+  if (auto error = NormalizeResponsesInput(body, &chat_body["messages"]))
+    return std::move(*error);
+  if (const auto* reasoning = body.find("reasoning")) {
+    if (!reasoning->is_object())
+      return InvalidCompatibilityRequest("'reasoning' must be an object");
+    for (const auto& [name, value] : reasoning->members()) {
+      if (name != "effort")
+        return InvalidCompatibilityRequest(
+            "only 'reasoning.effort' is supported");
+      if (const auto* top = body.find("reasoning_effort");
+          top && top->dump() != value.dump())
+        return InvalidCompatibilityRequest(
+            "reasoning.effort and reasoning_effort disagree");
+      chat_body["reasoning_effort"] = value;
+    }
   }
-  resp["model"] = b.model_id();
-  json::Value output = json::Value::array();
-  json::Value msg = json::Value::object();
-  msg["type"] = "message";
-  msg["id"] = "msg_" + RandomId();
-  msg["role"] = "assistant";
-  json::Value content = json::Value::array();
-  json::Value txt = json::Value::object();
-  txt["type"] = "output_text";
-  txt["text"] = core::Utf8Decoder{}.Push(res.text, true);
-  content.push_back(std::move(txt));
-  msg["content"] = std::move(content);
-  output.push_back(std::move(msg));
-  resp["output"] = std::move(output);
-  json::Value usage = json::Value::object();
-  usage["input_tokens"] = res.prompt_tokens;
-  usage["output_tokens"] = res.completion_tokens;
-  usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
-  json::Value input_details = json::Value::object();
-  input_details["cached_tokens"] = res.cached_prompt_tokens;
-  usage["input_tokens_details"] = std::move(input_details);
-  resp["usage"] = std::move(usage);
-  resp["timings"] = GenerationTimings(res);
-  return WithTiming(Ok(resp), res);
+  chat_body["model"] = b.model_id();
+  chat_body["max_completion_tokens"] = max_tokens;
+  const bool stream = body.find("stream") && body.find("stream")->as_bool();
+  if (stream)
+    chat_body["stream_options"]["include_usage"] = true;
+  auto chat_request = req;
+  chat_request.body = chat_body.dump();
+  auto response = HandleOpenAiChat(chat_request, b);
+  if (response.status != 200)
+    return response;
+  auto envelope = ResponsesEnvelope(body, chat_body, b.model_id(), max_tokens,
+                                    sampling_config);
+  if (stream) {
+    auto source = std::move(response.streaming_body);
+    auto source_log = response.stream_log;
+    // A protocol failure is delivered as a complete Responses event stream,
+    // not an unterminated HTTP chunked body. Retain its diagnostic as text.
+    response.stream_log = std::make_shared<HttpResponse::StreamLog>();
+    response.streaming_body =
+        [source = std::move(source), envelope = std::move(envelope), source_log,
+         log = response.stream_log](const HttpResponse::BodyWriter& writer) {
+          ResponsesStream adapter(envelope, writer);
+          source([&](std::string_view frame) { return adapter.Push(frame); });
+          if (source_log) {
+            log->details = source_log->details;
+            if (!source_log->error_code.empty()) {
+              log->details += " error_code=" + source_log->error_code;
+              if (!adapter.terminal())
+                log->error_code = source_log->error_code;
+            }
+          }
+        };
+    return response;
+  }
+  const auto chat = json::parse(response.body);
+  const auto& choice = chat.find("choices")->items().front();
+  const auto& message = *choice.find("message");
+  const bool limited = choice.member_str("finish_reason") == "length";
+  const char* status = limited ? "incomplete" : "completed";
+  const auto reasoning = message.member_str("reasoning_content");
+  const auto text = message.member_str("content");
+  const auto* calls = message.find("tool_calls");
+  const bool has_calls = calls && !calls->empty();
+  if (has_calls && calls->size() > 1 &&
+      !envelope.find("parallel_tool_calls")->as_bool())
+    return Err(502, "Bad Gateway",
+               "model generated parallel calls when disabled", "server_error",
+               "tool_choice_unsatisfied");
+  if (!reasoning.empty())
+    envelope["output"].push_back(
+        ResponsesItem("rs_" + RandomId(), reasoning, true,
+                      text.empty() && !has_calls ? status : "completed"));
+  if (!text.empty() || (reasoning.empty() && !has_calls))
+    envelope["output"].push_back(ResponsesItem(
+        "msg_" + RandomId(), text, false, has_calls ? "completed" : status));
+  if (has_calls) {
+    for (const auto& call : calls->items()) {
+      const auto& function = *call.find("function");
+      envelope["output"].push_back(
+          ResponsesFunctionItem("fc_" + RandomId(), call.member_str("id"),
+                                function.member_str("name"),
+                                function.member_str("arguments"), status));
+    }
+  }
+  envelope["status"] = status;
+  if (limited)
+    envelope["incomplete_details"]["reason"] = "max_output_tokens";
+  else
+    envelope["completed_at"] = Now();
+  envelope["usage"] = ResponsesUsage(*chat.find("usage"));
+  envelope["timings"] = *chat.find("timings");
+  response.body = envelope.dump();
+  return response;
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");

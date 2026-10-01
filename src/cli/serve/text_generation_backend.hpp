@@ -28,6 +28,9 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kOutputBackpressure,
   kSchedulerStopping,
   kToolChoiceUnsatisfied,
+  kAdmissionTimeout,
+  kClientInflightFull,
+  kPrefillBudgetFull,
 };
 
 class TextGenerationError final : public std::runtime_error {
@@ -40,6 +43,9 @@ public:
     switch (code_) {
       case TextGenerationErrorCode::kQueueFull:
       case TextGenerationErrorCode::kClientQueueFull:
+      case TextGenerationErrorCode::kAdmissionTimeout:
+      case TextGenerationErrorCode::kClientInflightFull:
+      case TextGenerationErrorCode::kPrefillBudgetFull:
         return 429;
       case TextGenerationErrorCode::kDeadlineExceeded:
         return 408;
@@ -68,6 +74,12 @@ public:
         return "scheduler_stopping";
       case TextGenerationErrorCode::kToolChoiceUnsatisfied:
         return "tool_choice_unsatisfied";
+      case TextGenerationErrorCode::kAdmissionTimeout:
+        return "admission_timeout";
+      case TextGenerationErrorCode::kClientInflightFull:
+        return "client_inflight_full";
+      case TextGenerationErrorCode::kPrefillBudgetFull:
+        return "prefill_budget_full";
     }
     return "generation_error";
   }
@@ -99,6 +111,8 @@ struct ChatRequest {
   bool add_vision_id{false};
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};
+  /// Immutable output grammar; each request owns a separate decoding cursor.
+  std::shared_ptr<const JsonConstraint> json_constraint;
 };
 
 /// Model-agnostic text generation boundary used by the HTTP transport.
@@ -156,7 +170,33 @@ public:
     std::size_t requested_logical_concurrency{1};
     std::size_t physical_execution_width{1};
     std::size_t max_buffered_output_bytes{0};
+    std::uint64_t request_id{0};
+    std::size_t resident_requests_at_submit{0};
+    std::size_t inflight_requests_at_submit{0};
+    std::size_t client_inflight_requests_at_submit{0};
+    std::optional<std::size_t> estimated_prefill_tokens;
+    std::size_t effective_prefill_tokens{0};
+    /// Legacy alias for queue_admission_ms; includes cancelled queued
+    /// residence.
     double queue_ms{0.0};
+    double queue_admission_ms{0.0};
+    /// Non-own service after admission, excluding this request's snapshot wait.
+    double resident_wait_ms{0.0};
+    /// Decode-ready time interrupted by peer prefill; subset of resident wait.
+    double peer_prefill_ms{0.0};
+    double snapshot_wait_ms{0.0};
+    /// Receipt/request_start through scheduler terminal, not transport drain.
+    double total_generation_wall_ms{0.0};
+    /// First decode-ready frontier through scheduler terminal, including
+    /// pauses.
+    double decode_wall_ms{0.0};
+    double max_prefill_chunk_ms{0.0};
+    bool first_token_emitted{false};
+    std::string prefix_checkpoint_kind;
+    std::size_t prefix_checkpoint_tokens{0};
+    std::size_t prefix_checkpoint_bytes{0};
+    double prefix_checkpoint_ms{0.0};
+    std::size_t prefix_checkpoint_failures{0};
     double cache_restore_ms{0.0};
     double cache_snapshot_ms{0.0};
     double cache_disk_enqueue_ms{0.0};
@@ -203,6 +243,7 @@ public:
 
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual bool ready() const = 0;
+  [[nodiscard]] virtual bool supports_json_constraints() const { return false; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }
@@ -269,6 +310,15 @@ TextGenerationBackend::start_chat(const ChatRequest& request,
                                   const CancellationCheck& is_cancelled,
                                   bool stream_output) {
   (void)stream_output;
+  if (request.json_constraint) {
+    sampling.Validate();
+    if (!supports_json_constraints())
+      throw std::invalid_argument(
+          "model does not support JSON constrained decoding");
+    if (sampling.temperature != 0)
+      throw std::invalid_argument(
+          "JSON constrained decoding requires temperature 0");
+  }
   class DeferredGenerationRequest final : public GenerationRequest {
   public:
     DeferredGenerationRequest(TextGenerationBackend& backend,

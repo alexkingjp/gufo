@@ -20,6 +20,26 @@ the same build, request budget, capacity and sampling configuration; live cost
 timings only steer greedy decoding. Draft sampling uses the full Q8 head's
 top 64 logits; upstream draft-sampler equivalence is not claimed.
 
+## Local serving research qualification
+
+The local research branch changes snapshot host allocation, checkpoint retention,
+API adapters and greedy C1 timing control; it does not change kernel arithmetic,
+weights, quantization or target verification. On the matched HTTP corpus all 33
+payloads and visible outputs are byte-identical to upstream `9cad139`. Sixteen
+sampled arithmetic requests (four callers, half streaming), seeded text replay,
+named-tool output and buffered/streamed reasoning-only Responses history replay
+pass. Focused serving/controller tests and cache ASan/UBSan tests pass.
+
+Timing-dependent greedy widths can produce different predictor-private cached
+state because draft catch-up uses different matrix shapes. That is not a claim
+of byte-identical predictor arithmetic. The session qualification compares all
+target persistent bytes, metadata and retained target hidden rows exactly; each
+greedy snapshot must restore to its own exact bytes and continue with identical
+target tokens, logits, RNG and positions against scalar reference decoding.
+Sampled snapshot bytes, widths, acceptance and seeded replay remain strict.
+No numerical tolerance or golden output is changed. This does not establish
+original BF16 model parity or remove the known vision qualification gap.
+
 ## Vision
 
 **One Gufo encoder comparison fails:** relative L2 **6.47%** versus official
