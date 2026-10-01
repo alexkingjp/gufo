@@ -15,7 +15,11 @@
 
 #include "qfn_mmq.h"
 #include "src/core/hip/snapshot_transfer.hpp"
+#include "src/core/hip/wait_policy.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/history_capacity.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/history_region_plan.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kv_quant.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -129,6 +133,39 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
       context, std::uint64_t{c.indexer_top_k} + batch)));
 }
 
+/// The history geometry for a config; single source for byte accounting
+/// and the arena region plan so they cannot drift apart.
+history::Shape HistoryShapeFor(const Config& c, bool mtp,
+                               std::size_t kv_row_bytes) {
+  return history::Shape{
+      .attention_layers = std::size_t{c.num_layers} / c.full_attention_interval,
+      .kv_row_bytes = kv_row_bytes,
+      .indexer_head_dim = c.indexer_head_dim,
+      .compress_ratio = c.compress_ratio,
+      .mtp = mtp,
+  };
+}
+
+std::size_t HistoryBytesFor(const Config& c, std::uint32_t positions, bool mtp,
+                            std::size_t kv_row_bytes) {
+  return history::BytesFor(HistoryShapeFor(c, mtp, kv_row_bytes), positions);
+}
+
+/// hipMalloc-backed device source for the shared history arena. Arena
+/// blocks are allocated once at executor creation; Allocate returning
+/// nullptr makes the arena's constructor fail closed (no partial pool).
+class HipArenaDevice final : public history::ArenaDevice {
+public:
+  [[nodiscard]] void* Allocate(std::size_t bytes) override {
+    void* p = nullptr;
+    return hipMalloc(&p, bytes) == hipSuccess ? p : nullptr;
+  }
+  void Free(void* ptr) noexcept override {
+    if (ptr != nullptr)
+      (void)hipFree(ptr);
+  }
+};
+
 }  // namespace
 
 Session::~Session() {
@@ -138,6 +175,12 @@ Session::~Session() {
   }
   for (void* p : allocations_) {
     (void)hipFree(p);
+  }
+  // Arena regions release implicitly after this body (history_regions_
+  // member destruction); their bytes were never charged to the elastic
+  // budget, so only the legacy path releases here.
+  if (owner_ != nullptr && !history_arena_backed_) {
+    owner_->ReleaseHistoryBytes(history_bytes_);
   }
 }
 
@@ -321,6 +364,35 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
+  }
+  if (e->options_.history_arena_bytes != 0) {
+    if (e->options_.history_budget_bytes != 0) {
+      AssignError(error_msg,
+                  "history_arena_bytes and history_budget_bytes are "
+                  "mutually exclusive");
+      return nullptr;
+    }
+    // One block must hold the largest single region: a K (or V) family at
+    // full speculative context in the wider of the two cache modes.
+    const std::size_t kv_row_bytes = e->KvRowBytes();
+    const std::size_t largest_region =
+        std::size_t{c.context_length} * kv_row_bytes;
+    const std::size_t block_floor = (largest_region + 0xFFFFF) & ~0xFFFFF;
+    const std::size_t block_bytes = std::max<std::size_t>(
+        e->options_.history_arena_bytes / 16, block_floor);
+    try {
+      e->history_arena_device_ = std::make_unique<HipArenaDevice>();
+      e->history_arena_ = std::make_shared<history::HistoryArena>(
+          history::ArenaOptions{
+              .budget_bytes = e->options_.history_arena_bytes,
+              .block_bytes = block_bytes,
+              .region_alignment = 256,
+          },
+          *e->history_arena_device_);
+    } catch (const std::exception& ex) {
+      AssignError(error_msg, ex.what());
+      return nullptr;
+    }
   }
   const std::size_t hc_dim = c.HcDim();
   const std::size_t hidden = c.hidden_size;
@@ -511,6 +583,59 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   // rows. Afterwards only an incomplete block precedes the current batch.
   // Completed block keys remain in block_k; their raw rows are dead.
   s->index_capacity_ = IndexerCapacity(c, options_.max_batch, max_context);
+  // Elastic mode sizes the position-scaled families to the initial
+  // capacity; the indexer ring keeps its full-shape geometry. The session
+  // records the reservation so ~Session releases it even when a later
+  // allocation below fails.
+  const std::uint32_t history_positions =
+      options_.history_budget_bytes != 0
+          ? std::min(max_context, std::max<std::uint32_t>(
+                                      options_.history_initial_positions, 1))
+          : max_context;
+  s->kv_capacity_ = history_positions;
+  const std::size_t kv_row_bytes = KvRowBytes();
+  s->history_bytes_ =
+      HistoryBytesFor(c, history_positions, s->mtp_enabled_, kv_row_bytes);
+  const bool arena_mode = history_arena_ != nullptr;
+  // Set before any arena region is carved: a failed construction destroys
+  // the session, and the arena path must not release bytes the elastic
+  // budget was never charged.
+  s->history_arena_backed_ = arena_mode;
+  if (!arena_mode && options_.history_budget_bytes != 0 &&
+      !ReserveHistoryBytes(s->history_bytes_, error_msg)) {
+    return nullptr;
+  }
+  // Arena regions are carved strictly in RegionPlanFor order (layer-major
+  // K, V, block keys; then the MTP draft's), matching the assignment order
+  // below, so one cursor covers both.
+  std::vector<history::RegionSpec> arena_plan;
+  std::size_t arena_cursor = 0;
+  if (arena_mode) {
+    arena_plan = history::RegionPlanFor(
+        HistoryShapeFor(c, s->mtp_enabled_, kv_row_bytes), history_positions);
+    s->history_regions_.reserve(arena_plan.size());
+  }
+  const auto arena_next = [&](void** pointer) -> bool {
+    if (arena_cursor >= arena_plan.size()) {
+      AssignError(error_msg, "history arena region plan underflow");
+      return false;
+    }
+    auto region = history_arena_->TryReserve(arena_plan[arena_cursor].bytes);
+    if (region == nullptr) {
+      AssignError(error_msg, "history arena exhausted: " +
+                                 std::to_string(s->history_regions_.size()) +
+                                 " regions live");
+      return false;
+    }
+    if (hipMemset(region->device_ptr(), 0, region->bytes()) != hipSuccess) {
+      AssignError(error_msg, "history arena region zero-fill failed");
+      return false;
+    }
+    *pointer = region->device_ptr();
+    s->history_regions_.push_back(std::move(region));
+    ++arena_cursor;
+    return true;
+  };
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
@@ -527,20 +652,48 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
-      at.v_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
+      void* k_pointer = nullptr;
+      void* v_pointer = nullptr;
+      if (arena_mode) {
+        if (!arena_next(&k_pointer) || !arena_next(&v_pointer))
+          return nullptr;
+        if (options_.kv_quant) {
+          at.k_store = static_cast<std::byte*>(k_pointer);
+          at.v_store = static_cast<std::byte*>(v_pointer);
+        } else {
+          at.k_cache = static_cast<__half*>(k_pointer);
+          at.v_cache = static_cast<__half*>(v_pointer);
+        }
+      } else if (options_.kv_quant) {
+        const std::size_t store_bytes =
+            static_cast<std::size_t>(history_positions) * kv_row_bytes;
+        at.k_store =
+            Alloc<std::byte>(a, store_bytes, error_msg, &s->allocated_bytes_);
+        at.v_store =
+            Alloc<std::byte>(a, store_bytes, error_msg, &s->allocated_bytes_);
+      } else {
+        at.k_cache = Alloc<__half>(
+            a, static_cast<std::size_t>(history_positions) * kv_row, error_msg,
+            &s->allocated_bytes_);
+        at.v_cache = Alloc<__half>(
+            a, static_cast<std::size_t>(history_positions) * kv_row, error_msg,
+            &s->allocated_bytes_);
+      }
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
-      at.block_k = Alloc<__half>(
-          a,
-          static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
-              c.indexer_head_dim,
-          error_msg, &s->allocated_bytes_);
+      if (arena_mode) {
+        void* block_pointer = nullptr;
+        if (!arena_next(&block_pointer))
+          return nullptr;
+        at.block_k = static_cast<__half*>(block_pointer);
+      } else {
+        at.block_k = Alloc<__half>(
+            a,
+            static_cast<std::size_t>(history_positions / c.compress_ratio + 1) *
+                c.indexer_head_dim,
+            error_msg, &s->allocated_bytes_);
+      }
     }
   }
   if (c.ple_layer >= 0) {
@@ -553,18 +706,48 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
-    s->mtp_.k_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
-    s->mtp_.v_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+    if (arena_mode) {
+      void* k_pointer = nullptr;
+      void* v_pointer = nullptr;
+      if (!arena_next(&k_pointer) || !arena_next(&v_pointer))
+        return nullptr;
+      if (options_.kv_quant) {
+        s->mtp_.k_store = static_cast<std::byte*>(k_pointer);
+        s->mtp_.v_store = static_cast<std::byte*>(v_pointer);
+      } else {
+        s->mtp_.k_cache = static_cast<__half*>(k_pointer);
+        s->mtp_.v_cache = static_cast<__half*>(v_pointer);
+      }
+    } else if (options_.kv_quant) {
+      const std::size_t store_bytes =
+          static_cast<std::size_t>(history_positions) * kv_row_bytes;
+      s->mtp_.k_store =
+          Alloc<std::byte>(a, store_bytes, error_msg, &s->allocated_bytes_);
+      s->mtp_.v_store =
+          Alloc<std::byte>(a, store_bytes, error_msg, &s->allocated_bytes_);
+    } else {
+      s->mtp_.k_cache =
+          Alloc<__half>(a, static_cast<std::size_t>(history_positions) * kv_row,
+                        error_msg, &s->allocated_bytes_);
+      s->mtp_.v_cache =
+          Alloc<__half>(a, static_cast<std::size_t>(history_positions) * kv_row,
+                        error_msg, &s->allocated_bytes_);
+    }
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
-    s->mtp_.block_k = Alloc<__half>(
-        a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
-        error_msg, &s->allocated_bytes_);
+    if (arena_mode) {
+      void* block_pointer = nullptr;
+      if (!arena_next(&block_pointer))
+        return nullptr;
+      s->mtp_.block_k = static_cast<__half*>(block_pointer);
+    } else {
+      s->mtp_.block_k =
+          Alloc<__half>(a,
+                        std::size_t{history_positions / c.compress_ratio + 1} *
+                            c.indexer_head_dim,
+                        error_msg, &s->allocated_bytes_);
+    }
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
   }
   for (void* p : a) {
@@ -578,6 +761,267 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     return nullptr;
   }
   return s;
+}
+
+std::size_t Executor::KvRowBytes() const noexcept {
+  const std::size_t kv_width = config().AttentionKvDim();
+  return options_.kv_quant ? kv::RowBytes(kv_width) : kv_width * sizeof(__half);
+}
+
+std::size_t Executor::ElasticHistoryBytes(
+    core::SessionMode mode, std::uint32_t positions) const noexcept {
+  return HistoryBytesFor(config(), positions,
+                         mode == core::SessionMode::kSpeculative && has_mtp(),
+                         KvRowBytes());
+}
+
+bool Executor::ReserveHistoryBytes(std::size_t delta,
+                                   std::string* error_msg) const {
+  if (delta == 0)
+    return true;
+  std::string refusal;
+  {
+    // The log sink must never run under this mutex: a blocking stderr
+    // freeze here would stall the whole engine (round-9 attempt 2).
+    const std::lock_guard<std::mutex> lock(history_budget_mutex_);
+    if (history_live_bytes_ >
+        options_.history_budget_bytes -
+            std::min(delta, options_.history_budget_bytes)) {
+      refusal = "elastic history budget exhausted (" +
+                std::to_string(history_live_bytes_) + " live of " +
+                std::to_string(options_.history_budget_bytes) +
+                " bytes; refusing +" + std::to_string(delta) + ")";
+    } else {
+      history_live_bytes_ += delta;
+    }
+  }
+  if (refusal.empty())
+    return true;
+  AssignError(error_msg, refusal);
+  if (options_.history_logger)
+    options_.history_logger(refusal);
+  return false;
+}
+
+/// Reserves the history slab once (budget-sized) and serves every grown
+/// buffer from it by pointer math: driver allocation inside the growth
+/// path wedged the GPU queue under near-full UMA pressure.
+bool Executor::AllocHistorySpan(std::size_t bytes, void** pointer,
+                                hipStream_t stream,
+                                std::string* error_msg) const {
+  // Stream-ordered: the allocation becomes valid for work enqueued after
+  // this point on stream, and never requires the host to drain the queue.
+  if (hipMallocAsync(pointer, bytes, stream) != hipSuccess) {
+    AssignError(error_msg, "history growth allocation of " +
+                               std::to_string(bytes) + " bytes failed");
+    return false;
+  }
+  return true;
+}
+
+void Executor::FreeHistorySpan(void* pointer,
+                               hipStream_t stream) const noexcept {
+  if (pointer == nullptr)
+    return;
+  (void)hipFreeAsync(pointer, stream);
+}
+
+void Executor::FreeHistorySpanUnlocked(void* pointer,
+                                       hipStream_t stream) const noexcept {
+  (void)hipFreeAsync(pointer, stream);
+}
+
+void Executor::ReleaseHistoryBytes(std::size_t bytes) const noexcept {
+  if (bytes == 0)
+    return;
+  const std::lock_guard<std::mutex> lock(history_budget_mutex_);
+  history_live_bytes_ -= std::min(bytes, history_live_bytes_);
+}
+
+/// Grows one history family: the fresh buffer comes from the history slab
+/// (pointer math — no driver allocation mid-flight), and the zero-fill +
+/// live-prefix copy are stream-ordered ON the compute stream, so they land
+/// after the work that still reads the old buffer and before the kernels
+/// that will write the new one. The old buffer is recorded for release at
+/// the next growth entry (stream drained) or at session destruction. On
+/// failure the session is left untouched.
+template<typename T>
+bool GrowHistoryBuffer(const Executor* executor, hipStream_t stream,
+                       std::vector<typename Session::GrownSpan>& grown,
+                       T* old_ptr, std::size_t new_count,
+                       std::size_t copy_bytes, T** slot,
+                       std::string* error_msg) {
+  const std::size_t bytes = new_count * sizeof(T);
+  void* p = nullptr;
+  if (!executor->AllocHistorySpan(bytes, &p, stream, error_msg)) {
+    return false;
+  }
+  (void)hipMemsetAsync(p, 0, bytes, stream);
+  if (copy_bytes != 0 &&
+      hipMemcpyAsync(p, old_ptr, copy_bytes, hipMemcpyDeviceToDevice, stream) !=
+          hipSuccess) {
+    executor->FreeHistorySpan(p, stream);
+    AssignError(error_msg, "history growth device copy failed");
+    return false;
+  }
+  *slot = static_cast<T*>(p);
+  grown.push_back({p, bytes});
+  return true;
+}
+
+bool Executor::EnsureHistoryCapacity(Session& session, std::uint32_t needed,
+                                     std::string* error_msg) const {
+  if (session.growth_corrupt_) {
+    AssignError(error_msg, "session needs reset after a failed history growth");
+    return false;
+  }
+  if (history_arena_ != nullptr) {
+    // Arena sessions are full-capacity, so reaching here means the request
+    // needs more than max_context; growth would reallocate what the pool
+    // already owns. Fail closed until region-swap growth exists (P1
+    // stage 3).
+    AssignError(error_msg,
+                "session context is full (arena-backed history is "
+                "fixed-capacity)");
+    return false;
+  }
+  if (options_.history_budget_bytes == 0 || needed <= session.kv_capacity_)
+    return true;
+  if (session.owner_ != this || needed > session.max_context_) {
+    AssignError(error_msg, "session context is full");
+    return false;
+  }
+  const auto& c = config();
+  const std::uint32_t next =
+      history::NextCapacity(session.kv_capacity_, needed, session.max_context_);
+  const std::size_t kv_row_bytes = KvRowBytes();
+  const std::size_t old_bytes = session.history_bytes_;
+  const std::size_t new_bytes =
+      HistoryBytesFor(c, next, session.mtp_enabled_, kv_row_bytes);
+  if (new_bytes < old_bytes ||
+      !ReserveHistoryBytes(new_bytes - old_bytes, error_msg)) {
+    return false;
+  }
+  // All-or-nothing growth: every new family buffer is allocated before
+  // anything is repointed, so an allocation failure leaves the session
+  // exactly as it was (fresh spans are unused and returned immediately).
+  struct FamilyPlan {
+    void** slot;
+    void* old_pointer;
+    std::size_t new_bytes;
+    std::size_t copy_bytes;
+    std::size_t old_bytes;
+  };
+  std::vector<FamilyPlan> plan;
+  const std::size_t kv_old = std::size_t{session.kv_capacity_} * kv_row_bytes;
+  const std::size_t block_old =
+      (std::size_t{session.kv_capacity_ / c.compress_ratio + 1} *
+       c.indexer_head_dim * sizeof(__half));
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (c.IsLinearLayer(il))
+      continue;
+    auto& at = session.attention_[il];
+    if (options_.kv_quant) {
+      plan.push_back({reinterpret_cast<void**>(&at.k_store), at.k_store,
+                      std::size_t{next} * kv_row_bytes, kv_old, kv_old});
+      plan.push_back({reinterpret_cast<void**>(&at.v_store), at.v_store,
+                      std::size_t{next} * kv_row_bytes, kv_old, kv_old});
+    } else {
+      plan.push_back({reinterpret_cast<void**>(&at.k_cache), at.k_cache,
+                      std::size_t{next} * kv_row_bytes, kv_old, kv_old});
+      plan.push_back({reinterpret_cast<void**>(&at.v_cache), at.v_cache,
+                      std::size_t{next} * kv_row_bytes, kv_old, kv_old});
+    }
+    plan.push_back({reinterpret_cast<void**>(&at.block_k), at.block_k,
+                    (std::size_t{next / c.compress_ratio + 1} *
+                     c.indexer_head_dim * sizeof(__half)),
+                    block_old, block_old});
+  }
+  if (session.mtp_enabled_) {
+    auto& mtp = session.mtp_;
+    const std::size_t mtp_kv_copy =
+        std::size_t{session.mtp_.position} * kv_row_bytes;
+    const std::size_t mtp_block_copy =
+        std::size_t{session.mtp_.blocks} * c.indexer_head_dim * sizeof(__half);
+    if (options_.kv_quant) {
+      plan.push_back({reinterpret_cast<void**>(&mtp.k_store), mtp.k_store,
+                      std::size_t{next} * kv_row_bytes, mtp_kv_copy, kv_old});
+      plan.push_back({reinterpret_cast<void**>(&mtp.v_store), mtp.v_store,
+                      std::size_t{next} * kv_row_bytes, mtp_kv_copy, kv_old});
+    } else {
+      plan.push_back({reinterpret_cast<void**>(&mtp.k_cache), mtp.k_cache,
+                      std::size_t{next} * kv_row_bytes, mtp_kv_copy, kv_old});
+      plan.push_back({reinterpret_cast<void**>(&mtp.v_cache), mtp.v_cache,
+                      std::size_t{next} * kv_row_bytes, mtp_kv_copy, kv_old});
+    }
+    plan.push_back({reinterpret_cast<void**>(&mtp.block_k), mtp.block_k,
+                    (std::size_t{next / c.compress_ratio + 1} *
+                     c.indexer_head_dim * sizeof(__half)),
+                    mtp_block_copy, block_old});
+  }
+  std::vector<void*> fresh(plan.size(), nullptr);
+  for (std::size_t index = 0; index < plan.size(); ++index) {
+    if (!AllocHistorySpan(plan[index].new_bytes, &fresh[index], stream(),
+                          error_msg)) {
+      for (std::size_t done = 0; done < index; ++done) {
+        FreeHistorySpan(fresh[done], stream());
+      }
+      ReleaseHistoryBytes(new_bytes - old_bytes);
+      return false;
+    }
+  }
+  // Pass 2: zero-fill, copy the live prefix, repoint, and retire the old
+  // buffers (release deferred to the next growth entry or session
+  // destruction — both drain the stream first).
+  for (std::size_t index = 0; index < plan.size(); ++index) {
+    const auto& item = plan[index];
+    (void)hipMemsetAsync(fresh[index], 0, item.new_bytes, stream_);
+    if (item.copy_bytes != 0 &&
+        hipMemcpyAsync(fresh[index], item.old_pointer, item.copy_bytes,
+                       hipMemcpyDeviceToDevice, stream_) != hipSuccess) {
+      for (std::size_t undo = index; undo < plan.size(); ++undo) {
+        FreeHistorySpan(fresh[undo], stream());
+      }
+      ReleaseHistoryBytes(new_bytes - old_bytes);
+      // A failed enqueue here is a device-level event: refuse the session.
+      session.growth_corrupt_ = true;
+      AssignError(error_msg, "history growth device copy failed");
+      return false;
+    }
+    *item.slot = fresh[index];
+  }
+  for (auto& item : plan) {
+    const auto allocation =
+        std::find(session.allocations_.begin(), session.allocations_.end(),
+                  item.old_pointer);
+    if (allocation != session.allocations_.end())
+      session.allocations_.erase(allocation);
+    FreeHistorySpan(item.old_pointer, stream());
+  }
+  session.kv_capacity_ = next;
+  session.history_bytes_ = new_bytes;
+  if (options_.history_logger) {
+    options_.history_logger(
+        "history growth: session capacity " + std::to_string(next) +
+        " positions, live " + std::to_string(history_live_bytes_) + " of " +
+        std::to_string(options_.history_budget_bytes) + " budget bytes");
+  }
+  return true;
+}
+
+float* Executor::BatchFrontierStaging(std::uint32_t slot,
+                                      std::string* error_msg) const {
+  constexpr std::uint32_t kMaxBatchSlots = 8;  // matches batch.cpp's limit
+  if (batch_frontier_host_ == nullptr) {
+    if (!Check(hipHostMalloc(&batch_frontier_host_,
+                             static_cast<std::size_t>(kMaxBatchSlots) *
+                                 config().vocab_size * sizeof(float)),
+               "batch frontier staging", error_msg)) {
+      return nullptr;
+    }
+  }
+  return batch_frontier_host_ +
+         static_cast<std::size_t>(slot) * config().vocab_size;
 }
 
 bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
@@ -637,8 +1081,9 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const std::size_t kv =
-      2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
+  // Two rows (K and V) per position; row bytes carry the f16 pair or the
+  // packed q8_0 width.
+  const std::size_t kv = 2 * std::size_t{max_context} * KvRowBytes();
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
           c.indexer_head_dim * sizeof(float) +
@@ -910,7 +1355,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
+  if (!gufo::hip::WaitEvent(counts_ready_, "expert counts", error_msg)) {
     return false;
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
@@ -1370,6 +1815,14 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::uint32_t max_context, bool sparse,
                          std::string* error_msg, bool last_only,
                          bool projections_ready, bool project_output) const {
+  // A quantized session must present its packed stores; a view built from
+  // the raw-cache fields alone (null under kv_quant) would fault the GPU
+  // instead of failing the request.
+  if (options_.kv_quant && (s.k_store == nullptr || s.v_store == nullptr)) {
+    AssignError(error_msg,
+                "quantized attention view is missing its packed stores");
+    return false;
+  }
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
@@ -1377,7 +1830,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !options_.kv_quant && !projections_ready && n_tokens >= 1024 &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
@@ -1398,11 +1851,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           !Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
         return false;
       }
-      prepared = PrepareAttention(
-          s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
-          s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
-          c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase);
+      // Quantized stores keep the packed format authoritative: projections
+      // always land in the f16 scratch and QuantizeKv converts below.
+      prepared = options_.kv_quant
+                     ? false
+                     : PrepareAttention(
+                           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
+                           l.attn_k_norm.f32(), s_.q, s_.attn_gate, s.k_cache,
+                           s.v_cache, n_tokens, c.num_heads, c.num_kv_heads,
+                           c.head_dim, c.rotary_dim, pos, c.rope_theta,
+                           c.rms_eps, stream_, s.rope, prefill_phase);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -1429,8 +1887,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
          c.rope_theta, stream_, s.rope);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope);
-    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
-    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
+    if (options_.kv_quant) {
+      QuantizeKv(s_.k, s.k_store, n_tokens, kv_row, pos, stream_);
+      QuantizeKv(s_.v, s.v_store, n_tokens, kv_row, pos, stream_);
+    } else {
+      StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
+      StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
+    }
   }
 
   // Raw keys survive only until pooling. The ring holds the initial
@@ -1488,17 +1951,26 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     return false;
   }
   if (MatrixRows(n_tokens) &&
-      WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, mask,
-                          mask_words_, s_.ctx, n_tokens, start_pos, c.num_heads,
-                          c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-                          last_only)) {
+      WmmaCausalAttention(s_.q, s_.attn_gate,
+                          s.k_store ? static_cast<const void*>(s.k_store)
+                                    : static_cast<const void*>(s.k_cache),
+                          s.v_store ? static_cast<const void*>(s.v_store)
+                                    : static_cast<const void*>(s.v_cache),
+                          options_.kv_quant, mask, mask_words_, s_.ctx,
+                          n_tokens, start_pos, c.num_heads, c.num_kv_heads,
+                          c.head_dim, c.compress_ratio, stream_, last_only)) {
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
+  rocm::Attention(s_.q,
+                  s.k_store ? static_cast<const void*>(s.k_store)
+                            : static_cast<const void*>(s.k_cache),
+                  s.v_store ? static_cast<const void*>(s.v_store)
+                            : static_cast<const void*>(s.v_cache),
+                  options_.kv_quant, mask, mask_words_, s_.ctx,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, c.num_heads, c.num_kv_heads, c.head_dim,
                   c.compress_ratio, stream_);
@@ -1702,7 +2174,7 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                               hidden.size_bytes(), hipMemcpyDeviceToHost,
                               stream_),
                "trunk hidden download", error_msg) &&
-         Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
+         gufo::hip::WaitStream(stream_, "trunk hidden", error_msg);
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
@@ -1785,8 +2257,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
-  return !synchronize ||
-         Check(hipStreamSynchronize(stream_), "forward", error_msg);
+  return !synchronize || gufo::hip::WaitStream(stream_, "forward", error_msg);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -1808,6 +2279,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
   if (session.owner_ != this || session.position_ + n > session.max_context_) {
     AssignError(error_msg, "session context is full");
+    return false;
+  }
+  if (!EnsureHistoryCapacity(session, session.position_ + n, error_msg)) {
     return false;
   }
   for (auto t : tokens) {
@@ -1858,8 +2332,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
-                     pool_grid <= graph_pool_grid &&
+  const bool graph = !prefill_phase && options_.history_budget_bytes == 0 &&
+                     n <= kVecBatch && pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
@@ -2017,7 +2491,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
 }
 
 bool Executor::Rollback(Session& session, std::uint32_t keep,
-                        std::string* error_msg, float* logits) const {
+                        std::string* error_msg, float* logits,
+                        bool wait) const {
   const Config& c = config();
   const std::uint32_t n = session.spec_tokens_;
   if (n == 0 || keep == 0 || keep > n) {
@@ -2074,10 +2549,12 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
             ? 0
             : std::min(session.blocks_, session.position_ / c.compress_ratio);
   }
-  if (!Check(hipStreamSynchronize(stream_), "rollback", error_msg)) {
-    return false;
+  if (logits == nullptr || wait) {
+    if (!gufo::hip::WaitStream(stream_, "rollback", error_msg)) {
+      return false;
+    }
   }
-  if (logits != nullptr) {
+  if (logits != nullptr && logits != logits_host_) {
     std::copy_n(logits_host_, c.vocab_size, logits);
   }
   return true;
@@ -2107,6 +2584,10 @@ struct SnapshotHeader {
   std::uint32_t mtp_blocks;
   std::uint32_t hidden_rows;
   std::uint32_t image_count;
+  /// Bytes of one K (or V) cache row per position: distinguishes f16 from
+  /// packed q8_0 payloads; executors reject cross-mode restores via
+  /// SameGeometry.
+  std::uint32_t kv_row_bytes;
   std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
   std::uint64_t payload_bytes;
 };
@@ -2115,7 +2596,8 @@ static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
 namespace {
 
 SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
-                                  const Session& session) {
+                                  const Session& session,
+                                  std::size_t kv_row_bytes) {
   SnapshotHeader h{};
   h.magic = kSnapshotMagic;
   h.num_layers = c.num_layers;
@@ -2128,6 +2610,7 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.hc_dim = c.HcDim();
   h.ple_elems = c.ple_layer >= 0 ? c.PleConvHistory() * c.HcDim() : 0;
   h.has_mtp = has_mtp ? 1 : 0;
+  h.kv_row_bytes = static_cast<std::uint32_t>(kv_row_bytes);
   h.position = session.position();
   h.image_count = session.VisionLayout().images.size();
   return h;
@@ -2138,7 +2621,7 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
   return h.magic == mine.magic && h.num_layers == mine.num_layers &&
          h.full_attention_interval == mine.full_attention_interval &&
          h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
-         h.kv_row == mine.kv_row &&
+         h.kv_row == mine.kv_row && h.kv_row_bytes == mine.kv_row_bytes &&
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
          h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp;
@@ -2150,8 +2633,9 @@ template<typename Visit>
 std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
                                      const Session* session, Visit&& visit) {
   std::uint64_t offset = sizeof(SnapshotHeader);
-  const auto region = [&](void* device, std::uint64_t bytes, const char* what) {
-    if (bytes != 0 && !visit(device, offset, bytes, what)) {
+  const auto region = [&](void* device, std::uint64_t bytes, const char* what,
+                          std::uint32_t history_key = 0) {
+    if (bytes != 0 && !visit(device, offset, bytes, what, history_key)) {
       return false;
     }
     offset += bytes;
@@ -2180,8 +2664,18 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
               std::uint64_t{h.ple_elems} * sizeof(float), "PLE history")) {
     return 0;
   }
-  const std::uint64_t kv_bytes =
-      std::uint64_t{h.position} * h.kv_row * sizeof(__half);
+  const std::uint64_t kv_bytes = std::uint64_t{h.position} * h.kv_row_bytes;
+  // Quantized sessions carry the packed stores; f16 sessions the raw
+  // halves. Head slices are 32-element aligned in both layouts.
+  const auto kv_region = [&](const Session::AttentionState& at, bool is_k) {
+    return session != nullptr ? (is_k ? (at.k_store != nullptr
+                                             ? static_cast<void*>(at.k_store)
+                                             : static_cast<void*>(at.k_cache))
+                                      : (at.v_store != nullptr
+                                             ? static_cast<void*>(at.v_store)
+                                             : static_cast<void*>(at.v_cache)))
+                              : nullptr;
+  };
   const std::uint64_t index_row_bytes =
       std::uint64_t{h.indexer_head_dim} * sizeof(float);
   const std::uint32_t index_begin = h.blocks * h.compress_ratio;
@@ -2191,8 +2685,10 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache") ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache")) {
+      if (!region(at != nullptr ? kv_region(*at, true) : nullptr, kv_bytes,
+                  "K cache", 1 + 3 * il) ||
+          !region(at != nullptr ? kv_region(*at, false) : nullptr, kv_bytes,
+                  "V cache", 2 + 3 * il)) {
         return 0;
       }
       // Serialize only unpooled rows, in chronological order. The physical
@@ -2211,7 +2707,7 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
           return 0;
       }
       if (!region(at != nullptr ? at->block_k : nullptr, block_bytes,
-                  "pooled block keys"))
+                  "pooled block keys", 3 + 3 * il))
         return 0;
     }
   }
@@ -2237,11 +2733,19 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
             "draft pooled keys"))
       return 0;
     const std::uint64_t mtp_kv_bytes =
-        std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
-    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
-                "draft K cache") ||
-        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
-                "draft V cache") ||
+        std::uint64_t{h.mtp_position} * h.kv_row_bytes;
+    // MTP catch-up can replay with another shape. Keep its entire frontier
+    // local until immutable predictor-prefix arithmetic is qualified.
+    if (!region(mtp != nullptr ? (mtp->k_store != nullptr
+                                      ? static_cast<void*>(mtp->k_store)
+                                      : static_cast<void*>(mtp->k_cache))
+                               : nullptr,
+                mtp_kv_bytes, "draft K cache") ||
+        !region(mtp != nullptr ? (mtp->v_store != nullptr
+                                      ? static_cast<void*>(mtp->v_store)
+                                      : static_cast<void*>(mtp->v_cache))
+                               : nullptr,
+                mtp_kv_bytes, "draft V cache") ||
         !region(mtp != nullptr ? mtp->h : nullptr,
                 std::uint64_t{h.hc_dim} * sizeof(float), "draft residual") ||
         !region(mtp != nullptr ? mtp->target_hidden : nullptr,
@@ -2257,19 +2761,19 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
   SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session, KvRowBytes());
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
   h.hidden_rows = hidden_rows;
-  return WalkSnapshot(
-      h, nullptr,
-      [](void*, std::uint64_t, std::uint64_t, const char*) { return true; });
+  return WalkSnapshot(h, nullptr,
+                      [](void*, std::uint64_t, std::uint64_t, const char*,
+                         std::uint32_t) { return true; });
 }
 
-bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
-                            std::span<std::uint8_t> payload,
-                            std::string* error_msg) const {
+bool Executor::ValidateSnapshotCapture(const Session& session,
+                                       std::uint32_t hidden_rows,
+                                       std::string* error_msg) const {
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -2284,8 +2788,16 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "kept trunk rows exceed the position or batch");
     return false;
   }
+  return session.CheckCancellation(error_msg);
+}
+
+bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
+                            std::span<std::uint8_t> payload,
+                            std::string* error_msg) const {
+  if (!ValidateSnapshotCapture(session, hidden_rows, error_msg))
+    return false;
   SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session, KvRowBytes());
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -2306,7 +2818,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
   }
   return WalkSnapshot(h, &session,
                       [&](void* device, std::uint64_t offset,
-                          std::uint64_t bytes, const char*) {
+                          std::uint64_t bytes, const char*, std::uint32_t) {
                         if (!session.CheckCancellation(error_msg))
                           return false;
                         transfer.Copy(payload.data() + offset, device, bytes);
@@ -2314,10 +2826,135 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                       }) != 0;
 }
 
+std::uint64_t Executor::SnapshotAllocationBytes(
+    const Session& session, std::uint32_t hidden_rows) const {
+  // Two sections per recurrent layer, at most five per attention layer,
+  // plus PLE, draft sections, header and image grids.
+  return snapshot::Storage::AllocationUpperBound(
+      SnapshotBytes(session, hidden_rows), 5 * config().num_layers + 12);
+}
+
+std::uint64_t Executor::SnapshotInheritedBytes(
+    const Session& session, std::uint32_t hidden_rows,
+    const snapshot::Storage* parent) const {
+  if (parent == nullptr)
+    return 0;
+  // Mirror SaveSharedSnapshot's parent validation: same geometry and an
+  // append-only position/block ordering, else nothing is inherited.
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session, KvRowBytes());
+  h.blocks = session.blocks_;
+  h.mtp_blocks = session.mtp_.blocks;
+  h.mtp_position = session.mtp_.position;
+  h.hidden_rows = hidden_rows;
+  SnapshotHeader previous{};
+  if (!parent->CopyTo(
+          0, {reinterpret_cast<std::uint8_t*>(&previous), sizeof(previous)}) ||
+      !SameGeometry(previous, h) || previous.position > h.position ||
+      previous.blocks > h.blocks || previous.mtp_position > h.mtp_position ||
+      previous.mtp_blocks > h.mtp_blocks)
+    return 0;
+  // The layout walk needs no device pointers; region sizes derive from the
+  // header alone (SnapshotBytes does the same with a null session).
+  std::vector<snapshot::Region> layout{{0, sizeof(h)}};
+  WalkSnapshot(h, nullptr,
+               [&](void*, std::uint64_t offset, std::uint64_t bytes,
+                   const char*, std::uint32_t history_key) {
+                 layout.push_back({offset, bytes, history_key});
+                 return true;
+               });
+  return parent->InheritedBytes(layout);
+}
+
+std::shared_ptr<const snapshot::Storage> Executor::SaveSharedSnapshot(
+    const Session& session, std::uint32_t hidden_rows,
+    const snapshot::Storage* parent, std::string* error_msg) const {
+  if (!ValidateSnapshotCapture(session, hidden_rows, error_msg))
+    return nullptr;
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session, KvRowBytes());
+  h.blocks = session.blocks_;
+  h.mtp_blocks = session.mtp_.blocks;
+  h.mtp_position = session.mtp_.position;
+  h.hidden_rows = hidden_rows;
+  h.ngram_prev = session.ngram_.prev;
+  h.payload_bytes = SnapshotBytes(session, hidden_rows);
+  if (parent != nullptr) {
+    SnapshotHeader previous{};
+    if (!parent->CopyTo(0, {reinterpret_cast<std::uint8_t*>(&previous),
+                            sizeof(previous)}) ||
+        !SameGeometry(previous, h) || previous.position > h.position ||
+        previous.blocks > h.blocks || previous.mtp_position > h.mtp_position ||
+        previous.mtp_blocks > h.mtp_blocks)
+      parent = nullptr;
+  }
+  struct Source {
+    std::uint64_t offset;
+    std::size_t bytes;
+    const void* data;
+    bool host;
+  };
+  std::vector<snapshot::Region> layout{{0, sizeof(h)}};
+  std::vector<Source> sources{{0, sizeof(h), &h, true}};
+  WalkSnapshot(h, &session,
+               [&](void* device, std::uint64_t offset, std::uint64_t bytes,
+                   const char*, std::uint32_t history_key) {
+                 layout.push_back({offset, bytes, history_key});
+                 sources.push_back({offset, bytes, device, false});
+                 return true;
+               });
+  const auto grid_bytes =
+      std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
+  if (grid_bytes != 0) {
+    const auto offset = h.payload_bytes - grid_bytes;
+    layout.push_back({offset, grid_bytes});
+    sources.push_back(
+        {offset, grid_bytes, session.VisionLayout().images.data(), true});
+  }
+  gufo::hip::SnapshotTransfer transfer;
+  return snapshot::Storage::Capture(
+      layout, parent, [&](auto offset, auto destination) {
+        if (!session.CheckCancellation(error_msg))
+          return false;
+        const auto source =
+            std::upper_bound(sources.begin(), sources.end(), offset,
+                             [](std::uint64_t start, const Source& s) {
+                               return start < s.offset;
+                             });
+        if (source == sources.begin())
+          return false;
+        const auto& s = *std::prev(source);
+        const auto skip = offset - s.offset;
+        if (skip > s.bytes || destination.size() > s.bytes - skip)
+          return false;
+        const auto* from = static_cast<const std::uint8_t*>(s.data) + skip;
+        if (s.host)
+          std::memcpy(destination.data(), from, destination.size());
+        else
+          transfer.Copy(destination.data(), from, destination.size());
+        return true;
+      });
+}
+
 bool Executor::RestoreSnapshot(Session& session,
                                std::span<const std::uint8_t> payload,
                                SnapshotInfo* info, std::string* error_msg,
                                std::uint32_t next_drafts) const {
+  return RestoreSnapshotView(session, snapshot::View(payload), info, error_msg,
+                             next_drafts);
+}
+
+bool Executor::RestoreSnapshot(Session& session,
+                               const snapshot::Storage& payload,
+                               SnapshotInfo* info, std::string* error_msg,
+                               std::uint32_t next_drafts) const {
+  return RestoreSnapshotView(session, snapshot::View(payload), info, error_msg,
+                             next_drafts);
+}
+
+bool Executor::RestoreSnapshotView(Session& session, snapshot::View payload,
+                                   SnapshotInfo* info, std::string* error_msg,
+                                   std::uint32_t next_drafts) const {
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -2327,9 +2964,10 @@ bool Executor::RestoreSnapshot(Session& session,
     return false;
   }
   SnapshotHeader h{};
-  std::memcpy(&h, payload.data(), sizeof(h));
+  if (!payload.CopyTo(0, {reinterpret_cast<std::uint8_t*>(&h), sizeof(h)}))
+    return false;
   const SnapshotHeader mine =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session, KvRowBytes());
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;
@@ -2353,10 +2991,15 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   if (h.payload_bytes != payload.size() ||
       WalkSnapshot(h, nullptr,
-                   [](void*, std::uint64_t, std::uint64_t, const char*) {
-                     return true;
-                   }) != payload.size()) {
+                   [](void*, std::uint64_t, std::uint64_t, const char*,
+                      std::uint32_t) { return true; }) != payload.size()) {
     AssignError(error_msg, "snapshot payload size does not match its header");
+    return false;
+  }
+  // The restore writes history rows up to h.position (and MTP rows to
+  // h.mtp_position); elastic sessions may need to grow first.
+  if (!EnsureHistoryCapacity(session, std::max(h.position, h.mtp_position),
+                             error_msg)) {
     return false;
   }
   qwen::vision::RopeLayout layout;
@@ -2364,8 +3007,10 @@ bool Executor::RestoreSnapshot(Session& session,
   const auto grid_bytes =
       layout.images.size() * sizeof(qwen::vision::ImageGrid);
   if (grid_bytes != 0) {
-    std::memcpy(layout.images.data(),
-                payload.data() + payload.size() - grid_bytes, grid_bytes);
+    if (!payload.CopyTo(payload.size() - grid_bytes,
+                        {reinterpret_cast<std::uint8_t*>(layout.images.data()),
+                         grid_bytes}))
+      return false;
   }
   try {
     layout.Validate(session.max_context_);
@@ -2381,7 +3026,7 @@ bool Executor::RestoreSnapshot(Session& session,
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
   // The session's queued work targets buffers the copies overwrite.
-  if (!Check(hipStreamSynchronize(stream_), "restore drain", error_msg)) {
+  if (!gufo::hip::WaitStream(stream_, "restore drain", error_msg)) {
     return false;
   }
   // Every live state region is overwritten below. Retain only scratch that
@@ -2392,11 +3037,18 @@ bool Executor::RestoreSnapshot(Session& session,
                                  remaining ? remaining - 1 : 0}));
   if (WalkSnapshot(h, &session,
                    [&](void* device, std::uint64_t offset, std::uint64_t bytes,
-                       const char* what) {
-                     return session.CheckCancellation(error_msg) &&
-                            Check(hipMemcpy(device, payload.data() + offset,
-                                            bytes, hipMemcpyHostToDevice),
-                                  what, error_msg);
+                       const char* what, std::uint32_t) {
+                     auto* destination = static_cast<std::uint8_t*>(device);
+                     return payload.VisitRange(offset, bytes, [&](auto source) {
+                       if (!session.CheckCancellation(error_msg) ||
+                           !Check(
+                               hipMemcpy(destination, source.data(),
+                                         source.size(), hipMemcpyHostToDevice),
+                               what, error_msg))
+                         return false;
+                       destination += source.size();
+                       return true;
+                     });
                    }) == 0) {
     session.Reset();
     return false;
@@ -2419,8 +3071,7 @@ bool Executor::RestoreSnapshot(Session& session,
 bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     std::string* error_msg) const {
   const auto rows = predictions.size();
-  if (rows == 0 || rows > options_.max_logit_rows || rows > kArgmaxParts ||
-      s_.mtp_ids == nullptr) {
+  if (rows == 0 || rows > kArgmaxParts || s_.mtp_ids == nullptr) {
     AssignError(error_msg, "invalid greedy MTP verification request");
     return false;
   }
@@ -2438,8 +3089,7 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                               predictions.size_bytes(), hipMemcpyDeviceToHost,
                               stream_),
                "greedy MTP predictions download", error_msg) &&
-         Check(hipStreamSynchronize(stream_), "greedy MTP verification",
-               error_msg);
+         gufo::hip::WaitStream(stream_, "greedy MTP verification", error_msg);
 }
 
 bool Executor::MtpForward(Session& session,
@@ -2479,6 +3129,9 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  if (!EnsureHistoryCapacity(session, pos + n, error_msg)) {
+    return false;
+  }
   ++session.mutation_epoch_;
   std::copy(tokens.begin(), tokens.end(), tokens_host_);
   control_host_->position = session.position_;
@@ -2492,7 +3145,8 @@ bool Executor::MtpForward(Session& session,
   const auto pool = sparse ? complete - session.mtp_.blocks : 0;
   const auto graph_pool = n / c.compress_ratio + 1;
   const bool graph = output.trace == nullptr && hidden_source == nullptr &&
-                     n <= kVecBatch && pool <= graph_pool &&
+                     options_.history_budget_bytes == 0 && n <= kVecBatch &&
+                     pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
   const std::uint64_t key =
       static_cast<std::uint64_t>(n) |
@@ -2571,12 +3225,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                   stream_);
   if (trace && !copy_trace(s_.mtp_res + final_row, trace->fused))
     return false;
-  Session::AttentionState attn;
-  attn.rope = session.vision_input_.rope();
-  attn.k_cache = session.mtp_.k_cache;
-  attn.v_cache = session.mtp_.v_cache;
-  attn.index_k = session.mtp_.index_k;
-  attn.block_k = session.mtp_.block_k;
+  Session::AttentionState attn = session.MtpAttentionView();
   // The draft block's attention runs at its own position.
   // Catch-up exports KV for every row but only carries its final residual.
   // Preserve that row's original query tile; earlier attention results

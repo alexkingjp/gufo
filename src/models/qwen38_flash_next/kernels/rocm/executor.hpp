@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -20,9 +21,11 @@
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/history_arena.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/snapshot_storage.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
@@ -54,6 +57,17 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// Live bytes of the elastic history families (K/V and pooled-key caches,
+  /// trunk and MTP). Zero when history preallocation is fixed at
+  /// max_context.
+  [[nodiscard]] std::size_t HistoryBytes() const noexcept {
+    return history_bytes_;
+  }
+  /// Positions the history families currently hold. Equal to max_context
+  /// outside elastic mode.
+  [[nodiscard]] std::uint32_t kv_capacity() const noexcept {
+    return kv_capacity_;
+  }
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
@@ -77,9 +91,28 @@ private:
     const qwen::vision::DeviceRope* rope{nullptr};
     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
+    /// Packed q8_0 stores (kv_quant.hpp); non-null in quantized mode,
+    /// where k_cache/v_cache are null.
+    std::byte* k_store{nullptr};
+    std::byte* v_store{nullptr};
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
     __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
   };
+  /// Attention view over the MTP draft history. The single constructor for
+  /// draft-side views — the batched catch-up path and MtpForward must not
+  /// hand-build these, or a new cache family (as k_store/v_store were)
+  /// silently misses one site and faults only under multi-session batches.
+  [[nodiscard]] Session::AttentionState MtpAttentionView() const noexcept {
+    Session::AttentionState view;
+    view.rope = vision_input_.rope();
+    view.k_cache = mtp_.k_cache;
+    view.v_cache = mtp_.v_cache;
+    view.k_store = mtp_.k_store;
+    view.v_store = mtp_.v_store;
+    view.index_k = mtp_.index_k;
+    view.block_k = mtp_.block_k;
+    return view;
+  }
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
   struct Control {
@@ -92,6 +125,8 @@ private:
   struct MtpState {
     __half* k_cache{nullptr};
     __half* v_cache{nullptr};
+    std::byte* k_store{nullptr};
+    std::byte* v_store{nullptr};
     float* index_k{nullptr};
     __half* block_k{nullptr};
     std::uint32_t blocks{0};
@@ -125,6 +160,32 @@ private:
   std::unordered_set<std::uint64_t> warmed_;
   std::vector<void*> allocations_;
   std::size_t allocated_bytes_{0};
+  /// History buffers allocated by growth, with their byte sizes. Grown
+  /// buffers live in the executor's history slab (or, if the slab could
+  /// not be reserved, in driver allocations) and are returned through
+  /// ReleaseHistorySpan / hipFree at destruction — never freed mid-flight.
+  struct GrownSpan {
+    void* pointer;
+    std::size_t bytes;
+  };
+  std::vector<GrownSpan> grown_spans_;
+  /// Set when a growth failed part-way (some families repointed, others
+  /// not): the session is unusable until Reset and every entry point
+  /// refuses it.
+  bool growth_corrupt_{false};
+  /// Live elastic history bytes; released against the executor budget on
+  /// destruction. Zero outside elastic mode.
+  std::size_t history_bytes_{0};
+  /// Positions the history families hold; equals max_context_ outside
+  /// elastic mode.
+  std::uint32_t kv_capacity_{0};
+  /// Arena-carved history regions backing the position-scaled families.
+  /// Releasing the handles (session destruction) returns the spans to the
+  /// executor's pool; the family pointers above alias them.
+  std::vector<std::shared_ptr<history::HistoryArena::Region>> history_regions_;
+  /// True when history_bytes_ is arena-backed: the elastic budget was
+  /// never charged, so destruction must not release against it.
+  bool history_arena_backed_{false};
   std::size_t rollback_bytes_{0};
   std::function<bool()> is_cancelled_;
   std::vector<float*> rollback_allocations_;
@@ -142,10 +203,46 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// Elastic session history: 0 keeps the legacy full-context
+    /// preallocation. A nonzero byte budget sizes every session's K/V and
+    /// pooled-key caches to their content — sessions start at
+    /// `history_initial_positions` positions and double on demand — while
+    /// the executor-wide live total stays within the budget. Frees the
+    /// device memory that fixed-shape sessions waste on unused context and
+    /// is what lets more lineages park warm on this host.
+    std::size_t history_budget_bytes{0};
+    std::uint32_t history_initial_positions{32768};
+    /// Shared history arena (P1 stage 2): 0 keeps per-session allocation
+    /// (fixed or elastic per history_budget_bytes above). A nonzero byte
+    /// budget preallocates one executor-wide region pool at creation and
+    /// every session's position-scaled K/V and pooled-key families are
+    /// carved from it as refcounted regions — no device allocation ever
+    /// runs during serving, and a released session's regions return to the
+    /// pool for the next lineage. Sessions are full-capacity; growth
+    /// (EnsureHistoryCapacity) fails closed in this mode. Mutually
+    /// exclusive with history_budget_bytes.
+    std::size_t history_arena_bytes{0};
+    /// Quantize session K/V caches to packed q8_0 blocks (kv_quant.hpp):
+    /// ~47% less history memory and halved attention-read traffic at
+    /// depth, at a small bounded per-element quantization error. Fused
+    /// prefill projection routes are bypassed when enabled. Snapshots
+    /// taken under this mode are rejected by executors running f16 (and
+    /// vice versa) via the payload header.
+    bool kv_quant{false};
+    /// Optional sink for elastic-history events (growth, budget refusal).
+    /// The server layer injects its logger; the executor stays free of
+    /// logging dependencies. Called from request threads; must be
+    /// thread-safe. Messages are engine diagnostics only.
+    std::function<void(std::string_view)> history_logger;
   };
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
+  /// True when session history comes from the shared preallocated arena
+  /// (Options::history_arena_bytes).
+  [[nodiscard]] bool history_arena_enabled() const noexcept {
+    return history_arena_ != nullptr;
+  }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
@@ -195,8 +292,8 @@ public:
   /// discards the rest. If `logits` is supplied, copies the kept frontier
   /// into it using the same synchronization as rollback.
   [[nodiscard]] bool Rollback(Session& session, std::uint32_t keep,
-                              std::string* error_msg,
-                              float* logits = nullptr) const;
+                              std::string* error_msg, float* logits = nullptr,
+                              bool wait = true) const;
 
   /// Runs the draft block over `tokens` (at most max_batch) at the session's
   /// MTP position. The hidden input of token i is the trunk residual of row
@@ -255,6 +352,25 @@ public:
                                   std::uint32_t hidden_rows,
                                   std::span<std::uint8_t> payload,
                                   std::string* error_msg) const;
+  /// Parent must come from this session's exact immutable capture lineage.
+  /// Only append-only KV/pooled keys share storage; raw rings are local.
+  [[nodiscard]] std::shared_ptr<const snapshot::Storage> SaveSharedSnapshot(
+      const Session& session, std::uint32_t hidden_rows,
+      const snapshot::Storage* parent, std::string* error_msg) const;
+  /// Data bytes of the capture layout that `parent` would serve without new
+  /// allocations: the same parent-geometry validation and layout walk that
+  /// SaveSharedSnapshot applies, without touching device memory. Returns 0
+  /// when the parent cannot contribute. Never an upper bound on its own —
+  /// subtract from SnapshotAllocationBytes for the incremental reservation.
+  [[nodiscard]] std::uint64_t SnapshotInheritedBytes(
+      const Session& session, std::uint32_t hidden_rows,
+      const snapshot::Storage* parent) const;
+  [[nodiscard]] std::uint64_t SnapshotAllocationBytes(
+      const Session& session, std::uint32_t hidden_rows) const;
+  [[nodiscard]] bool RestoreSnapshot(Session& session,
+                                     const snapshot::Storage& payload,
+                                     SnapshotInfo* info, std::string* error_msg,
+                                     std::uint32_t next_drafts = 0) const;
   /// Reuse at most the rollback rows needed by the restored operation;
   /// restoration never grows scratch. Callers derive this bound from the
   /// restored policy (or the concrete verifier width in a diagnostic).
@@ -284,12 +400,48 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+  [[nodiscard]] bool kv_quant() const noexcept { return options_.kv_quant; }
+  /// Bytes of one K (or V) cache row per position: f16 pairs, or packed
+  /// q8_0 when the session stores are quantized.
+  [[nodiscard]] std::size_t KvRowBytes() const noexcept;
+  /// Device bytes the elastic history families need at `positions` (K/V and
+  /// pooled-key caches, trunk and — for speculative sessions — MTP). The
+  /// indexer ring is bounded by top-k and the batch, not the context, so it
+  /// is excluded.
+  [[nodiscard]] std::size_t ElasticHistoryBytes(
+      core::SessionMode mode, std::uint32_t positions) const noexcept;
+  [[nodiscard]] std::uint32_t history_initial_positions() const noexcept {
+    return options_.history_initial_positions;
+  }
 
 private:
   Executor() = default;
 
-  /// Visits every device region of a snapshot in payload order with
-  /// (device pointer or null when sizing, payload offset, bytes, name).
+  friend struct Session;
+
+  /// Grows the session's history families to hold at least `needed`
+  /// positions (doubling from the current capacity), doubling first and
+  /// copying the live prefix device-to-device. Invalidates captured decode
+  /// graphs — the kernels take the family pointers as launch arguments —
+  /// and fails closed without touching the session when the executor-wide
+  /// elastic budget cannot cover the growth. No-op outside elastic mode.
+  [[nodiscard]] bool EnsureHistoryCapacity(Session& session,
+                                           std::uint32_t needed,
+                                           std::string* error_msg) const;
+  [[nodiscard]] bool ReserveHistoryBytes(std::size_t delta,
+                                         std::string* error_msg) const;
+  void ReleaseHistoryBytes(std::size_t bytes) const noexcept;
+
+  [[nodiscard]] bool RestoreSnapshotView(Session& session,
+                                         snapshot::View payload,
+                                         SnapshotInfo* info,
+                                         std::string* error_msg,
+                                         std::uint32_t next_drafts) const;
+  [[nodiscard]] bool ValidateSnapshotCapture(const Session& session,
+                                             std::uint32_t hidden_rows,
+                                             std::string* error_msg) const;
+  /// Visits every device region in payload order with (device pointer or null
+  /// when sizing, payload offset, bytes, name, append-only history key or 0).
   /// Returns the payload size, or 0 once a visit failed.
   template<typename Visit>
   static std::uint64_t WalkSnapshot(const SnapshotHeader& h,
@@ -404,6 +556,22 @@ private:
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
+  // Shared history arena (P1 stage 2). The device wrapper outlives the
+  // arena implementation here; regions keep the implementation alive, and
+  // sessions already must not outlive the executor (owner_), so region
+  // release never races executor destruction.
+  std::unique_ptr<history::ArenaDevice> history_arena_device_;
+  std::shared_ptr<history::HistoryArena> history_arena_;
+  // Elastic history budget accounting. Sessions grow from request threads;
+  // the counter guards the executor-wide live total.
+  mutable std::mutex history_budget_mutex_;
+  mutable std::size_t history_live_bytes_{0};
+  [[nodiscard]] bool AllocHistorySpan(std::size_t bytes, void** pointer,
+                                      hipStream_t stream,
+                                      std::string* error_msg) const;
+  void FreeHistorySpan(void* pointer, hipStream_t stream) const noexcept;
+  void FreeHistorySpanUnlocked(void* pointer,
+                               hipStream_t stream) const noexcept;
 
   // Scratch, sized for max_batch tokens. Names follow reference.cpp.
   struct Scratch {
@@ -499,6 +667,17 @@ private:
   bool AllocateBatch(std::string* error_msg) const;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
+  /// Pinned per-session frontier-logit staging for batched decode
+  /// epilogues (kBatchSessions x vocab), so one stream sync covers every
+  /// session's rollback download.
+  mutable float* batch_frontier_host_{nullptr};
+
+public:
+  /// Pinned staging slot `slot` (0..7) for a batched decode epilogue.
+  [[nodiscard]] float* BatchFrontierStaging(std::uint32_t slot,
+                                            std::string* error_msg) const;
+
+private:
   mutable Session::Control* batch_controls_{nullptr};
   mutable MtpCandidateLogits* batch_candidates_host_{nullptr};
   // Mapped descriptors, one slice per layer: GPU reads cannot race the host
