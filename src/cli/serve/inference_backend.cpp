@@ -2487,9 +2487,12 @@ public:
                                      : gufo::core::SessionMode::kAutoregressive,
                                  model_->history_initial_positions())
                        : 0),
+        // Arena pool: physically preallocated at executor creation, so
+        // hipMemGetInfo free already excludes it — subtracting it here
+        // again would double-count and zero out shared_left. The pool
+        // self-gates via TryReserve fail-closed.
         .shared_state_bytes =
-            history_arena_bytes_ != 0
-                ? std::optional<std::size_t>{history_arena_bytes_}
+            history_arena_bytes_ != 0 ? std::nullopt
             : history_budget_bytes_ != 0
                 ? std::optional<std::size_t>{history_budget_bytes_}
                 : std::nullopt,
