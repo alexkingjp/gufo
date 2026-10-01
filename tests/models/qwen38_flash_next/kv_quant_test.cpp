@@ -42,13 +42,13 @@ void CheckRoundTripErrorBound() {
 
     float amax = 0.0f;
     for (const auto x : row) {
-      amax = std::fmaxf(amax, std::fabsf(x));
+      amax = std::fmaxf(amax, std::fabs(x));
     }
     // Per-block quantization bounds the absolute error at half a quantum
     // step plus the f16 scale's own rounding.
     const float bound = amax / 127.0f * 0.501f + amax * 5e-4f;
     for (std::size_t i = 0; i < width; ++i) {
-      const float error = std::fabsf(row[i] - restored[i]);
+      const float error = std::fabs(row[i] - restored[i]);
       if (!(error <= bound)) {
         std::cerr << "error " << error << " exceeds bound " << bound
                   << " at trial " << trial << '\n';
@@ -107,8 +107,8 @@ void CheckSymmetry() {
   kv::DequantRow(packed.data(), b.data(), b.size());
   for (std::size_t i = 0; i < a.size(); ++i) {
     const float expected = a[i] * 16.0f;
-    const float tolerance = std::fabsf(expected) * 0.02f + 1e-3f;
-    Require(std::fabsf(b[i] - expected) <= tolerance,
+    const float tolerance = std::fabs(expected) * 0.02f + 1e-3f;
+    Require(std::fabs(b[i] - expected) <= tolerance,
             "quantization must be scale-invariant");
   }
 }
